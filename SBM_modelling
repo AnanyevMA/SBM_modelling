@@ -1,0 +1,279 @@
+# Импорт необходимых библиотек
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
+from scipy.linalg import pinvh
+from numba import njit, prange
+from tqdm import tqdm
+import warnings
+import logging
+
+# Игнорирование предупреждений для чистоты вывода
+warnings.filterwarnings('ignore')
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ==========================================
+# НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ
+# ==========================================
+TEST_FILE = '260302_Оригинал_тест.csv'  # Файл с тестовыми данными
+OUTPUT_FILE = 'results.xlsx'
+PLOT_FOLDER = 'sbm_plots'
+SEPARATOR = ';'
+LAMBDA_REG = 1e-3
+CHUNK_SIZE = 10000
+NUM_THREADS = 4
+DPI = 150
+
+# --- НАСТРОЙКИ РЕЖИМОВ ---
+# Название столбца, по которому определяется режим работы
+MODE_PARAMETER = 'Qmh' # ЗАМЕНИТЕ НА ВАШ ПАРАМЕТР (например, 'Мощность', 'Расход' и т.д.)
+
+# Настройка файлов обучения и условий для каждого режима
+# 'condition' - это функция. x означает текущее значение параметра MODE_PARAMETER.
+MODES = {
+    'Режим_Низкая_Нагрузка': {
+        'file': 'train_low_mode.csv',         # Файл обучения для этого режима
+        'condition': lambda x: x < 500        # Условие (например, Qmh меньше 500)
+    },
+    'Режим_Высокая_Нагрузка': {
+        'file': 'train_high_mode.csv',        # Файл обучения для этого режима
+        'condition': lambda x: x >= 500       # Условие (например, Qmh больше или равно 500)
+    }
+    # Можно добавить сколько угодно режимов...
+}
+# ==========================================
+
+# ==========================================
+# КЛАСС ДЛЯ ОБРАБОТКИ БОЛЬШИХ ДАННЫХ
+# ==========================================
+class BigDataProcessor:
+    """Класс для эффективного чтения и обработки больших CSV-файлов"""
+    def __init__(self, file_path):
+        self.file_path = file_path
+
+    def _count_rows(self):
+        with open(self.file_path, 'r', encoding='cp1251') as f:
+            return sum(1 for _ in f) - 1 
+
+    def stream_data(self):
+        chunks = []
+        with tqdm(total=self._count_rows(),
+                  desc=f"Чтение {os.path.basename(self.file_path)}",
+                  unit=' строк',
+                  file=sys.stdout) as pbar:
+            for chunk in pd.read_csv(
+                self.file_path,
+                sep=SEPARATOR,
+                parse_dates=[0],
+                dayfirst=True,
+                chunksize=CHUNK_SIZE,
+                decimal=',',
+                encoding='cp1251'
+            ):
+                chunk = chunk.set_index(chunk.columns[0])
+                chunks.append(chunk)
+                pbar.update(len(chunk))
+        return pd.concat(chunks)
+
+# ==========================================
+# ФУНКЦИЯ ДЛЯ ПРЕДОБРАБОТКИ ДАННЫХ
+# ==========================================
+def preprocess_data(df):
+    df = df.apply(pd.to_numeric, errors='coerce')
+    df = df.dropna(axis=1, how='all')
+    df = df.fillna(df.mean())
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(axis=1)
+    return df.astype(np.float32)
+
+# ==========================================
+# ОСНОВНОЙ КЛАСС РЕАЛИЗАЦИИ АЛГОРИТМА SBM
+# ==========================================
+class SBMEngine:
+    def __init__(self, train_data, lambda_reg=LAMBDA_REG):
+        self.D = train_data.astype(np.float32)
+        self.M, self.L = self.D.shape
+        self.lambda_reg = lambda_reg
+        self.K_inv = self._compute_similarity_matrix()
+
+    def _compute_similarity_matrix(self):
+        K = similarity_kernel(self.D)
+        K += self.lambda_reg * np.eye(self.M, dtype=np.float32)
+        return pinvh(K).astype(np.float32)
+
+    def predict(self, X):
+        return predict_kernel(self.D, self.K_inv, X.astype(np.float32))
+
+@njit(parallel=True, fastmath=True)
+def similarity_kernel(D):
+    M, L = D.shape
+    K = np.zeros((M, M), dtype=np.float32)
+    for i in prange(M):
+        for j in prange(i + 1):
+            if i == j:
+                K[i, j] = L
+            else:
+                diff = np.abs(D[i] - D[j])
+                K[i, j] = np.sum(1.0 / (1.0 + diff))
+                K[j, i] = K[i, j]
+    return K
+
+@njit(parallel=True, fastmath=True)
+def predict_kernel(D, K_inv, X):
+    predictions = np.zeros((X.shape[0], D.shape[1]), dtype=np.float32)
+    for i in prange(X.shape[0]):
+        x = X[i]
+        diff = np.abs(D - x)
+        similarities = 1.0 / (1.0 + diff)
+        k = np.sum(similarities, axis=1).astype(np.float32)
+        w_hat = K_inv @ k
+        w = w_hat / np.sum(w_hat)
+        w = w.astype(np.float32)
+        D_transposed = D.T.astype(np.float32)
+        predictions[i] = D_transposed @ w
+    return predictions
+
+# ==========================================
+# ФУНКЦИИ ВИЗУАЛИЗАЦИИ И СОХРАНЕНИЯ РЕЗУЛЬТАТОВ
+# ==========================================
+def visualize_results(data, param):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
+    
+    # Рисуем только те точки, где есть прогноз (отбрасываем NaN)
+    plot_data = data.dropna(subset=['Predicted'])
+    
+    ax1.plot(data.index, data['Actual'], label='Фактические значения', color='blue', linewidth=1.5)
+    ax1.plot(plot_data.index, plot_data['Predicted'], '.', label='Прогноз SBM', color='orange', markersize=3)
+    ax1.set_title(f'Параметр: {param}', fontsize=12)
+    ax1.legend(loc='upper left')
+    ax1.grid(alpha=0.3)
+    ax1.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
+
+    ax2.plot(plot_data.index, plot_data['Deviation'], color='red', linewidth=1.0, label='Отклонение')
+    ax2.axhline(0, color='black', linestyle='--', linewidth=0.8)
+    ax2.grid(alpha=0.3)
+    ax2.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
+
+    safe_param = str(param).translate(str.maketrans('<>:"/\\|?*', '_________'))
+    plot_path = os.path.join(PLOT_FOLDER, f'{safe_param}.png')
+    
+    plt.savefig(plot_path, dpi=DPI, bbox_inches='tight')
+    plt.close()
+
+def save_output(results, summary):
+    with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+        pd.DataFrame(summary, columns=['Параметр', 'MAPE(%)', 'Макс. отклонение']).to_excel(writer, sheet_name='Сводка', index=False)
+        for param, df in results.items():
+            safe_sheet_name = str(param).translate(str.maketrans('[]:*?/\\', '_______'))[:31]
+            df.to_excel(writer, sheet_name=safe_sheet_name, index_label='Дата', float_format="%.4f")
+
+# ==========================================
+# ОСНОВНАЯ ФУНКЦИЯ ЗАПУСКА
+# ==========================================
+def main():
+    try:
+        os.makedirs(PLOT_FOLDER, exist_ok=True)
+
+        # ---------------------------------------------------------
+        # Этап 1: Загрузка и подготовка базовых тестовых данных
+        # ---------------------------------------------------------
+        logging.info("\n[1/4] Загрузка тестовой выборки:")
+        test_processor = BigDataProcessor(TEST_FILE)
+        test_df = test_processor.stream_data()
+        test_df = preprocess_data(test_df)
+        test_df.index = pd.to_datetime(test_df.index, dayfirst=True, errors='coerce')
+
+        if MODE_PARAMETER not in test_df.columns:
+            raise ValueError(f"Параметр режима '{MODE_PARAMETER}' не найден в тестовых данных!")
+
+        # Создаем пустой DataFrame для хранения всех будущих прогнозов из разных режимов
+        all_predictions = pd.DataFrame(index=test_df.index, columns=test_df.columns, dtype=np.float32)
+
+        # ---------------------------------------------------------
+        # Этап 2 & 3: Обучение и прогнозирование по режимам
+        # ---------------------------------------------------------
+        logging.info("\n[2/4] и [3/4] Обработка режимов:")
+        
+        for mode_name, config in MODES.items():
+            logging.info(f"\n---> Запуск: {mode_name} <---")
+            
+            # 1. Выделяем данные, соответствующие текущему режиму
+            condition_mask = config['condition'](test_df[MODE_PARAMETER])
+            mode_test_df = test_df[condition_mask]
+            
+            if mode_test_df.empty:
+                logging.warning(f"Для режима '{mode_name}' нет подходящих данных в тесте. Пропускаем.")
+                continue
+                
+            logging.info(f"Найдено {len(mode_test_df)} строк для режима '{mode_name}'")
+
+            # 2. Загружаем соответствующий обучающий файл
+            train_file = config['file']
+            if not os.path.exists(train_file):
+                logging.error(f"Файл {train_file} не найден! Пропускаем режим.")
+                continue
+                
+            train_processor = BigDataProcessor(train_file)
+            train_df = train_processor.stream_data()
+            train_df = preprocess_data(train_df)
+
+            # 3. Ищем общие параметры
+            common_params = sorted(list(set(train_df.columns) & set(mode_test_df.columns)))
+            
+            # 4. Обучаем модель для этого режима
+            logging.info("Обучение модели...")
+            model = SBMEngine(train_df[common_params].values)
+
+            # 5. Делаем прогноз для выделенного кусочка тестовых данных
+            logging.info("Прогнозирование...")
+            mode_test_data = mode_test_df[common_params].values.astype(np.float32)
+            mode_preds = model.predict(mode_test_data)
+
+            # 6. Вписываем полученные прогнозы в общий "котёл" прогнозов (all_predictions)
+            all_predictions.loc[condition_mask, common_params] = mode_preds
+
+        # ---------------------------------------------------------
+        # Этап 4: Финализация и сохранение
+        # ---------------------------------------------------------
+        logging.info("\n[4/4] Формирование результатов:")
+        
+        # Оставляем только те параметры, для которых был сделан хоть какой-то прогноз
+        predicted_params = [col for col in test_df.columns if all_predictions[col].notna().any()]
+        
+        results = {}
+        summary = []
+        
+        for idx, param in enumerate(tqdm(predicted_params, desc="Параметры")):
+            result_df = pd.DataFrame({
+                'Actual': test_df[param],
+                'Predicted': all_predictions[param],
+                'Deviation': test_df[param] - all_predictions[param]
+            }, index=test_df.index)
+
+            # Считаем метрики только по тем точкам, где был прогноз (исключаем NaN)
+            valid_data = result_df.dropna()
+            
+            if not valid_data.empty:
+                mask = valid_data['Actual'] != 0
+                mape = (np.abs(valid_data['Deviation'][mask]) / np.abs(valid_data['Actual'][mask])).mean() * 100
+                max_dev = valid_data['Deviation'].abs().max()
+            else:
+                mape, max_dev = 0.0, 0.0
+
+            summary.append([param, f"{mape:.2f}", f"{max_dev:.4f}"])
+            results[param] = result_df
+
+            visualize_results(result_df, param)
+
+        save_output(results, summary)
+        logging.info(f"\nАнализ завершен! Результаты сохранены:\n- {OUTPUT_FILE}\n- Папка: {PLOT_FOLDER}")
+
+    except Exception as e:
+        logging.error(f"\nКритическая ошибка: {str(e)}")
+
+if __name__ == "__main__":
+    main()
