@@ -28,6 +28,16 @@ LAMBDA_REG = 1e-3
 CHUNK_SIZE = 10000
 DPI = 150
 
+# --- НАСТРОЙКИ ФОРМАТА ДАТ ---
+# Скрипт попытается применить эти форматы по очереди. 
+# Если ни один не подойдет (или список пуст []), включится автоматическое распознавание.
+DATE_FORMATS = [
+    '%d.%m.%Y %H:%M:%S', # 01.08.2025 14:00:00
+    '%d.%m.%Y %H:%M',    # 01.08.2025 14:00
+    '%d.%m.%Y',          # 01.08.2025
+    '%Y-%m-%d %H:%M:%S'  # 2025-08-01 14:00:00
+]
+
 # --- НАСТРОЙКИ РЕЖИМОВ ---
 # Название столбца, по которому определяется режим работы
 MODE_PARAMETER = 'Qmh' # ЗАМЕНИТЕ НА ВАШ ПАРАМЕТР (например, 'Мощность', 'Расход' и т.д.)
@@ -35,14 +45,13 @@ MODE_PARAMETER = 'Qmh' # ЗАМЕНИТЕ НА ВАШ ПАРАМЕТР (напр
 # Настройка файлов обучения и условий для каждого режима
 MODES = {
     'Режим_Низкая_Нагрузка': {
-        'file': 'train_low_mode.csv',         # Файл обучения для этого режима
-        'condition': lambda x: x < 500        # Условие (например, Qmh меньше 500)
+        'file': 'train_low_mode.csv',         
+        'condition': lambda x: x < 500        
     },
     'Режим_Высокая_Нагрузка': {
-        'file': 'train_high_mode.csv',        # Файл обучения для этого режима
-        'condition': lambda x: x >= 500       # Условие (например, Qmh больше или равно 500)
+        'file': 'train_high_mode.csv',        
+        'condition': lambda x: x >= 500       
     }
-    # Можно добавить сколько угодно режимов...
 }
 # ==========================================
 
@@ -62,11 +71,11 @@ class BigDataProcessor:
             try:
                 with open(self.file_path, 'r', encoding=enc) as f:
                     f.read(8192)
-                logging.info(f"[{os.path.basename(self.file_path)}] Кодировка определена как: {enc}")
+                logging.info(f"[{os.path.basename(self.file_path)}] Кодировка: {enc}")
                 return enc
             except UnicodeDecodeError:
                 continue
-        logging.warning(f"[{os.path.basename(self.file_path)}] Не удалось точно определить кодировку. Используется utf-8.")
+        logging.warning(f"[{os.path.basename(self.file_path)}] Кодировка не определена точно. Используется utf-8.")
         return 'utf-8'
 
     def _count_rows(self):
@@ -82,15 +91,39 @@ class BigDataProcessor:
             for chunk in pd.read_csv(
                 self.file_path,
                 sep=SEPARATOR,
-                parse_dates=[0],
-                dayfirst=True,
                 chunksize=CHUNK_SIZE,
                 encoding=self.encoding
-                # параметр decimal удален для универсальной обработки ниже
+                # Убрали parse_dates, чтобы контролировать парсинг времени вручную
             ):
-                chunk = chunk.set_index(chunk.columns[0])
+                # Находим название первой колонки (колонки с временем)
+                date_col = chunk.columns[0]
+                date_series = chunk[date_col].astype(str)
+                
+                parsed_dates = pd.Series(pd.NaT, index=chunk.index)
+                
+                # 1. Сначала пытаемся применить заданные форматы
+                if DATE_FORMATS:
+                    for fmt in DATE_FORMATS:
+                        mask = parsed_dates.isna()
+                        if not mask.any():
+                            break
+                        parsed_dates[mask] = pd.to_datetime(date_series[mask], format=fmt, errors='coerce')
+                
+                # 2. Для оставшихся нераспознанных дат (или если список форматов пуст) используем умный автопарсинг
+                mask = parsed_dates.isna()
+                if mask.any():
+                    parsed_dates[mask] = pd.to_datetime(date_series[mask], dayfirst=True, errors='coerce')
+                
+                # Присваиваем распознанные даты обратно
+                chunk[date_col] = parsed_dates
+                
+                # 3. Удаляем мусорные строки, где дата так и не смогла распознаться
+                chunk = chunk.dropna(subset=[date_col])
+                
+                chunk = chunk.set_index(date_col)
                 chunks.append(chunk)
                 pbar.update(len(chunk))
+                
         return pd.concat(chunks)
 
 # ==========================================
@@ -98,21 +131,13 @@ class BigDataProcessor:
 # ==========================================
 def preprocess_data(df):
     """Очищает данные и универсально обрабатывает десятичные разделители"""
-    # 1. Универсальная обработка дробей (замена запятых на точки)
     string_columns = df.select_dtypes(include=['object']).columns
     for col in string_columns:
         df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
         
-    # 2. Принудительный перевод в числа (весь мусор станет NaN)
     df = df.apply(pd.to_numeric, errors='coerce')
-    
-    # 3. Удаляем полностью пустые столбцы
     df = df.dropna(axis=1, how='all')
-    
-    # 4. Заполняем оставшиеся пропуски средними значениями
     df = df.fillna(df.mean())
-    
-    # 5. Зачищаем бесконечности (если вдруг возникло деление на ноль)
     df = df.replace([np.inf, -np.inf], np.nan).dropna(axis=1)
     
     return df.astype(np.float32)
@@ -170,7 +195,6 @@ def predict_kernel(D, K_inv, X):
 def visualize_results(data, param):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
     
-    # Рисуем только те точки, где есть прогноз (отбрасываем NaN)
     plot_data = data.dropna(subset=['Predicted'])
     
     ax1.plot(data.index, data['Actual'], label='Фактические значения', color='blue', linewidth=1.5)
@@ -212,12 +236,10 @@ def main():
         test_processor = BigDataProcessor(TEST_FILE)
         test_df = test_processor.stream_data()
         test_df = preprocess_data(test_df)
-        test_df.index = pd.to_datetime(test_df.index, dayfirst=True, errors='coerce')
 
         if MODE_PARAMETER not in test_df.columns:
             raise ValueError(f"Параметр режима '{MODE_PARAMETER}' не найден в тестовых данных!")
 
-        # Создаем пустой DataFrame для хранения всех будущих прогнозов из разных режимов
         all_predictions = pd.DataFrame(index=test_df.index, columns=test_df.columns, dtype=np.float32)
 
         # ---------------------------------------------------------
@@ -228,7 +250,6 @@ def main():
         for mode_name, config in MODES.items():
             logging.info(f"\n---> Запуск: {mode_name} <---")
             
-            # 1. Выделяем данные, соответствующие текущему режиму
             condition_mask = config['condition'](test_df[MODE_PARAMETER])
             mode_test_df = test_df[condition_mask]
             
@@ -238,7 +259,6 @@ def main():
                 
             logging.info(f"Найдено {len(mode_test_df)} строк для режима '{mode_name}'")
 
-            # 2. Загружаем соответствующий обучающий файл
             train_file = config['file']
             if not os.path.exists(train_file):
                 logging.error(f"Файл {train_file} не найден! Пропускаем режим.")
@@ -248,19 +268,15 @@ def main():
             train_df = train_processor.stream_data()
             train_df = preprocess_data(train_df)
 
-            # 3. Ищем общие параметры
             common_params = sorted(list(set(train_df.columns) & set(mode_test_df.columns)))
             
-            # 4. Обучаем модель для этого режима
             logging.info("Обучение модели...")
             model = SBMEngine(train_df[common_params].values)
 
-            # 5. Делаем прогноз для выделенного кусочка тестовых данных
             logging.info("Прогнозирование...")
             mode_test_data = mode_test_df[common_params].values.astype(np.float32)
             mode_preds = model.predict(mode_test_data)
 
-            # 6. Вписываем полученные прогнозы в общий "котёл" прогнозов
             all_predictions.loc[condition_mask, common_params] = mode_preds
 
         # ---------------------------------------------------------
@@ -268,7 +284,6 @@ def main():
         # ---------------------------------------------------------
         logging.info("\n[4/4] Формирование результатов:")
         
-        # Оставляем только те параметры, для которых был сделан хоть какой-то прогноз
         predicted_params = [col for col in test_df.columns if all_predictions[col].notna().any()]
         
         results = {}
@@ -281,7 +296,6 @@ def main():
                 'Deviation': test_df[param] - all_predictions[param]
             }, index=test_df.index)
 
-            # Считаем метрики только по тем точкам, где был прогноз (исключаем NaN)
             valid_data = result_df.dropna()
             
             if not valid_data.empty:
