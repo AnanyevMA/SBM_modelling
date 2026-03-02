@@ -26,7 +26,6 @@ PLOT_FOLDER = 'sbm_plots'
 SEPARATOR = ';'
 LAMBDA_REG = 1e-3
 CHUNK_SIZE = 10000
-NUM_THREADS = 4
 DPI = 150
 
 # --- НАСТРОЙКИ РЕЖИМОВ ---
@@ -34,7 +33,6 @@ DPI = 150
 MODE_PARAMETER = 'Qmh' # ЗАМЕНИТЕ НА ВАШ ПАРАМЕТР (например, 'Мощность', 'Расход' и т.д.)
 
 # Настройка файлов обучения и условий для каждого режима
-# 'condition' - это функция. x означает текущее значение параметра MODE_PARAMETER.
 MODES = {
     'Режим_Низкая_Нагрузка': {
         'file': 'train_low_mode.csv',         # Файл обучения для этого режима
@@ -55,9 +53,24 @@ class BigDataProcessor:
     """Класс для эффективного чтения и обработки больших CSV-файлов"""
     def __init__(self, file_path):
         self.file_path = file_path
+        self.encoding = self._detect_encoding()
+
+    def _detect_encoding(self):
+        """Пытается угадать кодировку файла"""
+        encodings_to_try = ['utf-8', 'cp1251', 'latin-1', 'ansi']
+        for enc in encodings_to_try:
+            try:
+                with open(self.file_path, 'r', encoding=enc) as f:
+                    f.read(8192)
+                logging.info(f"[{os.path.basename(self.file_path)}] Кодировка определена как: {enc}")
+                return enc
+            except UnicodeDecodeError:
+                continue
+        logging.warning(f"[{os.path.basename(self.file_path)}] Не удалось точно определить кодировку. Используется utf-8.")
+        return 'utf-8'
 
     def _count_rows(self):
-        with open(self.file_path, 'r', encoding='cp1251') as f:
+        with open(self.file_path, 'r', encoding=self.encoding) as f:
             return sum(1 for _ in f) - 1 
 
     def stream_data(self):
@@ -72,8 +85,8 @@ class BigDataProcessor:
                 parse_dates=[0],
                 dayfirst=True,
                 chunksize=CHUNK_SIZE,
-                decimal=',',
-                encoding='cp1251'
+                encoding=self.encoding
+                # параметр decimal удален для универсальной обработки ниже
             ):
                 chunk = chunk.set_index(chunk.columns[0])
                 chunks.append(chunk)
@@ -84,10 +97,24 @@ class BigDataProcessor:
 # ФУНКЦИЯ ДЛЯ ПРЕДОБРАБОТКИ ДАННЫХ
 # ==========================================
 def preprocess_data(df):
+    """Очищает данные и универсально обрабатывает десятичные разделители"""
+    # 1. Универсальная обработка дробей (замена запятых на точки)
+    string_columns = df.select_dtypes(include=['object']).columns
+    for col in string_columns:
+        df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
+        
+    # 2. Принудительный перевод в числа (весь мусор станет NaN)
     df = df.apply(pd.to_numeric, errors='coerce')
+    
+    # 3. Удаляем полностью пустые столбцы
     df = df.dropna(axis=1, how='all')
+    
+    # 4. Заполняем оставшиеся пропуски средними значениями
     df = df.fillna(df.mean())
+    
+    # 5. Зачищаем бесконечности (если вдруг возникло деление на ноль)
     df = df.replace([np.inf, -np.inf], np.nan).dropna(axis=1)
+    
     return df.astype(np.float32)
 
 # ==========================================
@@ -233,7 +260,7 @@ def main():
             mode_test_data = mode_test_df[common_params].values.astype(np.float32)
             mode_preds = model.predict(mode_test_data)
 
-            # 6. Вписываем полученные прогнозы в общий "котёл" прогнозов (all_predictions)
+            # 6. Вписываем полученные прогнозы в общий "котёл" прогнозов
             all_predictions.loc[condition_mask, common_params] = mode_preds
 
         # ---------------------------------------------------------
