@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
+import seaborn as sns
 from scipy.linalg import pinvh
 from numba import njit, prange
 from tqdm import tqdm
@@ -20,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==========================================
 # НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ
 # ==========================================
-TEST_FILE = '260302_Оригинал_тест.csv'  # Файл с тестовыми данными
+TEST_FILE = '260302_Оригинал_тест.csv'  
 OUTPUT_FILE = 'results.xlsx'
 PLOT_FOLDER = 'sbm_plots'
 SEPARATOR = ';'
@@ -28,21 +29,20 @@ LAMBDA_REG = 1e-3
 CHUNK_SIZE = 10000
 DPI = 150
 
+# --- НАСТРОЙКИ АНАЛИТИКИ И ДИАГНОСТИКИ ---
+SIGMA_MULTIPLIER = 3.0  # Уставка для расчета "коридора нормы" (правило 3-х сигм)
+
 # --- НАСТРОЙКИ ФОРМАТА ДАТ ---
-# Скрипт попытается применить эти форматы по очереди. 
-# Если ни один не подойдет (или список пуст []), включится автоматическое распознавание.
 DATE_FORMATS = [
-    '%d.%m.%Y %H:%M:%S', # 01.08.2025 14:00:00
-    '%d.%m.%Y %H:%M',    # 01.08.2025 14:00
-    '%d.%m.%Y',          # 01.08.2025
-    '%Y-%m-%d %H:%M:%S'  # 2025-08-01 14:00:00
+    '%d.%m.%Y %H:%M:%S', 
+    '%d.%m.%Y %H:%M',    
+    '%d.%m.%Y',          
+    '%Y-%m-%d %H:%M:%S'  
 ]
 
 # --- НАСТРОЙКИ РЕЖИМОВ ---
-# Название столбца, по которому определяется режим работы
-MODE_PARAMETER = 'Qmh' # ЗАМЕНИТЕ НА ВАШ ПАРАМЕТР (например, 'Мощность', 'Расход' и т.д.)
+MODE_PARAMETER = 'Qmh' # Параметр, определяющий режим
 
-# Настройка файлов обучения и условий для каждого режима
 MODES = {
     'Режим_Низкая_Нагрузка': {
         'file': 'train_low_mode.csv',         
@@ -59,13 +59,11 @@ MODES = {
 # КЛАСС ДЛЯ ОБРАБОТКИ БОЛЬШИХ ДАННЫХ
 # ==========================================
 class BigDataProcessor:
-    """Класс для эффективного чтения и обработки больших CSV-файлов"""
     def __init__(self, file_path):
         self.file_path = file_path
         self.encoding = self._detect_encoding()
 
     def _detect_encoding(self):
-        """Пытается угадать кодировку файла"""
         encodings_to_try = ['utf-8', 'cp1251', 'latin-1', 'ansi']
         for enc in encodings_to_try:
             try:
@@ -84,53 +82,31 @@ class BigDataProcessor:
 
     def stream_data(self):
         chunks = []
-        with tqdm(total=self._count_rows(),
-                  desc=f"Чтение {os.path.basename(self.file_path)}",
-                  unit=' строк',
-                  file=sys.stdout) as pbar:
-            for chunk in pd.read_csv(
-                self.file_path,
-                sep=SEPARATOR,
-                chunksize=CHUNK_SIZE,
-                encoding=self.encoding
-                # Убрали parse_dates, чтобы контролировать парсинг времени вручную
-            ):
-                # Находим название первой колонки (колонки с временем)
+        with tqdm(total=self._count_rows(), desc=f"Чтение {os.path.basename(self.file_path)}", unit=' строк', file=sys.stdout) as pbar:
+            for chunk in pd.read_csv(self.file_path, sep=SEPARATOR, chunksize=CHUNK_SIZE, encoding=self.encoding):
                 date_col = chunk.columns[0]
                 date_series = chunk[date_col].astype(str)
-                
                 parsed_dates = pd.Series(pd.NaT, index=chunk.index)
                 
-                # 1. Сначала пытаемся применить заданные форматы
                 if DATE_FORMATS:
                     for fmt in DATE_FORMATS:
                         mask = parsed_dates.isna()
-                        if not mask.any():
-                            break
+                        if not mask.any(): break
                         parsed_dates[mask] = pd.to_datetime(date_series[mask], format=fmt, errors='coerce')
                 
-                # 2. Для оставшихся нераспознанных дат (или если список форматов пуст) используем умный автопарсинг
                 mask = parsed_dates.isna()
                 if mask.any():
                     parsed_dates[mask] = pd.to_datetime(date_series[mask], dayfirst=True, errors='coerce')
                 
-                # Присваиваем распознанные даты обратно
                 chunk[date_col] = parsed_dates
-                
-                # 3. Удаляем мусорные строки, где дата так и не смогла распознаться
                 chunk = chunk.dropna(subset=[date_col])
-                
                 chunk = chunk.set_index(date_col)
                 chunks.append(chunk)
                 pbar.update(len(chunk))
                 
         return pd.concat(chunks)
 
-# ==========================================
-# ФУНКЦИЯ ДЛЯ ПРЕДОБРАБОТКИ ДАННЫХ
-# ==========================================
 def preprocess_data(df):
-    """Очищает данные и универсально обрабатывает десятичные разделители"""
     string_columns = df.select_dtypes(include=['object']).columns
     for col in string_columns:
         df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
@@ -139,7 +115,6 @@ def preprocess_data(df):
     df = df.dropna(axis=1, how='all')
     df = df.fillna(df.mean())
     df = df.replace([np.inf, -np.inf], np.nan).dropna(axis=1)
-    
     return df.astype(np.float32)
 
 # ==========================================
@@ -197,6 +172,7 @@ def visualize_results(data, param):
     
     plot_data = data.dropna(subset=['Predicted'])
     
+    # 1. График Факта и Прогноза
     ax1.plot(data.index, data['Actual'], label='Фактические значения', color='blue', linewidth=1.5)
     ax1.plot(plot_data.index, plot_data['Predicted'], '.', label='Прогноз SBM', color='orange', markersize=3)
     ax1.set_title(f'Параметр: {param}', fontsize=12)
@@ -204,8 +180,16 @@ def visualize_results(data, param):
     ax1.grid(alpha=0.3)
     ax1.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
 
+    # 2. График Отклонений с Динамическими уставками
     ax2.plot(plot_data.index, plot_data['Deviation'], color='red', linewidth=1.0, label='Отклонение')
-    ax2.axhline(0, color='black', linestyle='--', linewidth=0.8)
+    ax2.plot(plot_data.index, plot_data['Threshold'], 'k--', alpha=0.6, label=f'+{SIGMA_MULTIPLIER}σ (Уставка)')
+    ax2.plot(plot_data.index, -plot_data['Threshold'], 'k--', alpha=0.6, label=f'-{SIGMA_MULTIPLIER}σ (Уставка)')
+    ax2.axhline(0, color='black', linestyle='-', linewidth=0.8)
+    
+    # Закрашиваем коридор нормы
+    ax2.fill_between(plot_data.index, plot_data['Threshold'], -plot_data['Threshold'], color='gray', alpha=0.1)
+    
+    ax2.legend(loc='upper left')
     ax2.grid(alpha=0.3)
     ax2.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
 
@@ -215,9 +199,17 @@ def visualize_results(data, param):
     plt.savefig(plot_path, dpi=DPI, bbox_inches='tight')
     plt.close()
 
-def save_output(results, summary):
+def save_output(results, summary, mode_summary):
     with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
-        pd.DataFrame(summary, columns=['Параметр', 'MAPE(%)', 'Макс. отклонение']).to_excel(writer, sheet_name='Сводка', index=False)
+        # Лист 1: Сводка со всеми метриками
+        cols = ['Параметр', 'MAPE(%)', 'Макс. отклонение', 'MBE (Смещение)', 'RMSE', 'R2 (Детерминация)']
+        pd.DataFrame(summary, columns=cols).to_excel(writer, sheet_name='Сводка', index=False)
+        
+        # Лист 2: Диагностика по режимам
+        cols_mode = ['Режим', 'Параметр', 'Ср. абсолютная ошибка (MAE)']
+        pd.DataFrame(mode_summary, columns=cols_mode).to_excel(writer, sheet_name='Диагностика по режимам', index=False)
+        
+        # Листы с параметрами
         for param, df in results.items():
             safe_sheet_name = str(param).translate(str.maketrans('[]:*?/\\', '_______'))[:31]
             df.to_excel(writer, sheet_name=safe_sheet_name, index_label='Дата', float_format="%.4f")
@@ -229,9 +221,6 @@ def main():
     try:
         os.makedirs(PLOT_FOLDER, exist_ok=True)
 
-        # ---------------------------------------------------------
-        # Этап 1: Загрузка и подготовка базовых тестовых данных
-        # ---------------------------------------------------------
         logging.info("\n[1/4] Загрузка тестовой выборки:")
         test_processor = BigDataProcessor(TEST_FILE)
         test_df = test_processor.stream_data()
@@ -241,11 +230,10 @@ def main():
             raise ValueError(f"Параметр режима '{MODE_PARAMETER}' не найден в тестовых данных!")
 
         all_predictions = pd.DataFrame(index=test_df.index, columns=test_df.columns, dtype=np.float32)
+        all_sigmas = pd.DataFrame(index=test_df.index, columns=test_df.columns, dtype=np.float32)
+        mode_tracking = pd.Series('Неизвестно', index=test_df.index)
 
-        # ---------------------------------------------------------
-        # Этап 2 & 3: Обучение и прогнозирование по режимам
-        # ---------------------------------------------------------
-        logging.info("\n[2/4] и [3/4] Обработка режимов:")
+        logging.info("\n[2/4] и [3/4] Обработка режимов и расчет динамических уставок:")
         
         for mode_name, config in MODES.items():
             logging.info(f"\n---> Запуск: {mode_name} <---")
@@ -256,8 +244,6 @@ def main():
             if mode_test_df.empty:
                 logging.warning(f"Для режима '{mode_name}' нет подходящих данных в тесте. Пропускаем.")
                 continue
-                
-            logging.info(f"Найдено {len(mode_test_df)} строк для режима '{mode_name}'")
 
             train_file = config['file']
             if not os.path.exists(train_file):
@@ -270,48 +256,118 @@ def main():
 
             common_params = sorted(list(set(train_df.columns) & set(mode_test_df.columns)))
             
-            logging.info("Обучение модели...")
-            model = SBMEngine(train_df[common_params].values)
+            logging.info("Обучение модели и вычисление базовой погрешности (σ)...")
+            train_data = train_df[common_params].values
+            model = SBMEngine(train_data)
+            
+            # Расчет стандартного отклонения (sigma) на эталонных данных для динамических уставок
+            train_preds = model.predict(train_data)
+            train_error = train_data - train_preds
+            mode_sigma = np.std(train_error, axis=0)
+            mode_sigma[mode_sigma == 0] = 1e-6 # Защита от деления на ноль
 
             logging.info("Прогнозирование...")
             mode_test_data = mode_test_df[common_params].values.astype(np.float32)
             mode_preds = model.predict(mode_test_data)
 
             all_predictions.loc[condition_mask, common_params] = mode_preds
+            all_sigmas.loc[condition_mask, common_params] = mode_sigma
+            mode_tracking.loc[condition_mask] = mode_name
 
-        # ---------------------------------------------------------
-        # Этап 4: Финализация и сохранение
-        # ---------------------------------------------------------
-        logging.info("\n[4/4] Формирование результатов:")
+        logging.info("\n[4/4] Формирование результатов и расширенной аналитики:")
         
         predicted_params = [col for col in test_df.columns if all_predictions[col].notna().any()]
         
         results = {}
         summary = []
+        mode_summary = []
         
-        for idx, param in enumerate(tqdm(predicted_params, desc="Параметры")):
+        # 1. Генерация таблиц и графиков по параметрам
+        for idx, param in enumerate(tqdm(predicted_params, desc="Анализ параметров")):
             result_df = pd.DataFrame({
                 'Actual': test_df[param],
                 'Predicted': all_predictions[param],
-                'Deviation': test_df[param] - all_predictions[param]
+                'Deviation': test_df[param] - all_predictions[param],
+                'Threshold': all_sigmas[param] * SIGMA_MULTIPLIER
             }, index=test_df.index)
 
             valid_data = result_df.dropna()
             
             if not valid_data.empty:
+                # Базовые метрики
                 mask = valid_data['Actual'] != 0
                 mape = (np.abs(valid_data['Deviation'][mask]) / np.abs(valid_data['Actual'][mask])).mean() * 100
                 max_dev = valid_data['Deviation'].abs().max()
+                
+                # Расширенные метрики
+                mbe = valid_data['Deviation'].mean()
+                rmse = np.sqrt((valid_data['Deviation'] ** 2).mean())
+                
+                ss_res = (valid_data['Deviation'] ** 2).sum()
+                ss_tot = ((valid_data['Actual'] - valid_data['Actual'].mean()) ** 2).sum()
+                r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
             else:
-                mape, max_dev = 0.0, 0.0
+                mape, max_dev, mbe, rmse, r2 = 0.0, 0.0, 0.0, 0.0, 0.0
 
-            summary.append([param, f"{mape:.2f}", f"{max_dev:.4f}"])
+            summary.append([param, f"{mape:.2f}", f"{max_dev:.4f}", f"{mbe:.4f}", f"{rmse:.4f}", f"{r2:.4f}"])
             results[param] = result_df
-
             visualize_results(result_df, param)
+            
+            # Аналитика по режимам
+            for mode in MODES.keys():
+                mask_mode = (mode_tracking == mode) & result_df['Deviation'].notna()
+                if mask_mode.any():
+                    mae_mode = np.abs(result_df.loc[mask_mode, 'Deviation']).mean()
+                    mode_summary.append([mode, param, f"{mae_mode:.4f}"])
 
-        save_output(results, summary)
-        logging.info(f"\nАнализ завершен! Результаты сохранены:\n- {OUTPUT_FILE}\n- Папка: {PLOT_FOLDER}")
+        # 2. Построение Тепловой Карты (Heatmap)
+        logging.info("Построение Тепловой Карты...")
+        Z_score = (np.abs(test_df[predicted_params] - all_predictions[predicted_params]) / all_sigmas[predicted_params]).astype(float)
+        
+        fig, ax = plt.subplots(figsize=(16, max(8, len(predicted_params)*0.3)))
+        Z_plot = Z_score.dropna(how='all')
+        
+        # Уменьшаем плотность точек по времени, если их слишком много, чтобы Heatmap не завис
+        if len(Z_plot) > 800:
+            Z_plot = Z_plot.iloc[::len(Z_plot)//800]
+            
+        Z_plot.index = Z_plot.index.strftime('%Y-%m-%d %H:%M')
+        
+        # Рисуем Heatmap (Зеленый -> Желтый -> Красный)
+        sns.heatmap(Z_plot.T, cmap='RdYlGn_r', vmin=0, vmax=SIGMA_MULTIPLIER * 1.5, ax=ax, 
+                    cbar_kws={'label': 'Нормированное отклонение (Z-score)'})
+        ax.set_title(f"Тепловая карта аномалий (Красный цвет = превышение уставки {SIGMA_MULTIPLIER}σ)", fontsize=14)
+        plt.savefig(os.path.join(PLOT_FOLDER, '00_Deviation_Heatmap.png'), dpi=DPI, bbox_inches='tight')
+        plt.close()
+
+        # 3. Индекс технического состояния (Overall Health Score)
+        logging.info("Расчет Индекса Здоровья (Health Score)...")
+        # Штраф за каждое превышение порога
+        exceedances = np.maximum(0, Z_score - SIGMA_MULTIPLIER)
+        active_params_count = Z_score.notna().sum(axis=1)
+        active_params_count[active_params_count == 0] = 1 # Защита от деления на 0
+        
+        # Взвешенная сумма нормированных отклонений переводится в %
+        mean_exceedance = exceedances.sum(axis=1) / active_params_count
+        health_score = np.maximum(0, 100 - mean_exceedance * 50) # Если средний датчик превышает норму на 2 сигмы -> здоровье 0%
+        
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.plot(health_score.index, health_score, color='green', linewidth=2)
+        ax.fill_between(health_score.index, health_score, 0, color='green', alpha=0.1)
+        ax.set_title("Индекс технического состояния оборудования (Overall Health Score)", fontsize=14)
+        ax.set_ylabel("Health Score, %")
+        ax.set_ylim(0, 105)
+        ax.axhline(80, color='orange', linestyle='--', label='Предупреждение (80%)')
+        ax.axhline(50, color='red', linestyle='--', label='Критическое состояние (50%)')
+        ax.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
+        ax.grid(alpha=0.3)
+        ax.legend()
+        plt.savefig(os.path.join(PLOT_FOLDER, '00_Health_Score.png'), dpi=DPI, bbox_inches='tight')
+        plt.close()
+
+        # Сохранение итогов
+        save_output(results, summary, mode_summary)
+        logging.info(f"\nАнализ завершен! Результаты сохранены:\n- {OUTPUT_FILE}\n- Графики и аналитика в папке: {PLOT_FOLDER}")
 
     except Exception as e:
         logging.error(f"\nКритическая ошибка: {str(e)}")
