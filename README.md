@@ -39,7 +39,9 @@ MODES = {
         'condition': lambda x: x >= 500       
     }
 }
-ЗапускBashpython sbm_engine.py
+
+Запуск
+Bashpython sbm_engine.py
 
 📊 Структура выходных данных
 После успешного выполнения скрипт создаст:
