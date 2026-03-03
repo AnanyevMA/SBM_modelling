@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==========================================
 # НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ
 # ==========================================
-TEST_FILE = '260302_Оригинал_тест.csv'  
+TEST_FILE = 'СУРФ51-3_работа.csv'  
 OUTPUT_FILE = 'results.xlsx'
 PLOT_FOLDER = 'sbm_plots'
 SEPARATOR = ';'
@@ -41,16 +41,16 @@ DATE_FORMATS = [
 ]
 
 # --- НАСТРОЙКИ РЕЖИМОВ ---
-MODE_PARAMETER = 'Qmh' # Параметр, определяющий режим
+MODE_PARAMETER = 'Gрец(тч)' # Параметр, определяющий режим
 
 MODES = {
-    'Режим_Низкая_Нагрузка': {
-        'file': 'train_low_mode.csv',         
-        'condition': lambda x: x < 500        
+    'Режим_1': {
+        'file': 'СУРФ51-3_Режим1.csv',         
+        'condition': lambda x: x >= 9        
     },
-    'Режим_Высокая_Нагрузка': {
-        'file': 'train_high_mode.csv',        
-        'condition': lambda x: x >= 500       
+    'Режим_2': {
+        'file': 'СУРФ51-3_Режим2.csv',        
+        'condition': lambda x: x < 9       
     }
 }
 # ==========================================
@@ -174,9 +174,9 @@ def visualize_results(data, param):
     
     # 1. График Факта и Прогноза
     ax1.plot(data.index, data['Actual'], label='Фактические значения', color='blue', linewidth=1.5)
-    ax1.plot(plot_data.index, plot_data['Predicted'], '.', label='Прогноз SBM', color='orange', markersize=3)
+    ax1.plot(plot_data.index, plot_data['Predicted'], '--', label='Прогноз SBM', color='orange', linewidth=1.0)
     ax1.set_title(f'Параметр: {param}', fontsize=12)
-    ax1.legend(loc='upper left')
+    ax1.legend(loc='upper left', fontsize=12)
     ax1.grid(alpha=0.3)
     ax1.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
 
@@ -184,12 +184,12 @@ def visualize_results(data, param):
     ax2.plot(plot_data.index, plot_data['Deviation'], color='red', linewidth=1.0, label='Отклонение')
     ax2.plot(plot_data.index, plot_data['Threshold'], 'k--', alpha=0.6, label=f'+{SIGMA_MULTIPLIER}σ (Уставка)')
     ax2.plot(plot_data.index, -plot_data['Threshold'], 'k--', alpha=0.6, label=f'-{SIGMA_MULTIPLIER}σ (Уставка)')
-    ax2.axhline(0, color='black', linestyle='-', linewidth=0.8)
+    ax2.axhline(0, color='black', linestyle='-', linewidth=0.4)
     
     # Закрашиваем коридор нормы
     ax2.fill_between(plot_data.index, plot_data['Threshold'], -plot_data['Threshold'], color='gray', alpha=0.1)
     
-    ax2.legend(loc='upper left')
+    ax2.legend(loc='best', fontsize=7)
     ax2.grid(alpha=0.3)
     ax2.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
 
@@ -261,9 +261,7 @@ def main():
             model = SBMEngine(train_data)
             
             # Расчет стандартного отклонения (sigma) на эталонных данных для динамических уставок
-            train_preds = model.predict(train_data)
-            train_error = train_data - train_preds
-            mode_sigma = np.std(train_error, axis=0)
+            mode_sigma = np.std(train_data, axis=0)
             mode_sigma[mode_sigma == 0] = 1e-6 # Защита от деления на ноль
 
             logging.info("Прогнозирование...")
@@ -290,8 +288,12 @@ def main():
                 'Deviation': test_df[param] - all_predictions[param],
                 'Threshold': all_sigmas[param] * SIGMA_MULTIPLIER
             }, index=test_df.index)
+            
+            is_exceeded = np.abs(result_df['Deviation']) > result_df['Threshold']
+            result_df['Превышение уставки'] = np.where(is_exceeded, 'Да', 'Нет')
+            result_df.loc[result_df['Deviation'].isna(), 'Превышение уставки'] = np.nan
 
-            valid_data = result_df.dropna()
+            valid_data = result_df.dropna(subset=['Predicted'])
             
             if not valid_data.empty:
                 # Базовые метрики
@@ -357,7 +359,7 @@ def main():
         ax.set_title("Индекс технического состояния оборудования (Overall Health Score)", fontsize=14)
         ax.set_ylabel("Health Score, %")
         ax.set_ylim(0, 105)
-        ax.axhline(80, color='orange', linestyle='--', label='Предупреждение (80%)')
+        ax.axhline(75, color='orange', linestyle='--', label='Предупреждение (75%)')
         ax.axhline(50, color='red', linestyle='--', label='Критическое состояние (50%)')
         ax.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
         ax.grid(alpha=0.3)
