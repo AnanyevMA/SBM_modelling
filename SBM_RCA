@@ -35,8 +35,9 @@ SIGMA_MULTIPLIER = 3.0  # Уставка для "коридора нормы"
 MIN_DURATION = 3        # Минимальная длительность аномалии (в точках) для записи в Журнал инцидентов
 
 # Настройки поиска первопричины (RCA - Root Cause Analysis)
-CORR_WINDOW = 50        # Окно измерений для расчета тесноты связи (последние 50 точек до пика)
-CORR_THRESHOLD = 0.65   # Порог тесноты связи по модулю 
+CORR_WINDOW = 50              # Окно измерений для расчета тесноты связи (последние 50 точек до пика)
+CORR_THRESHOLD = 0.65         # Порог тесноты связи по модулю для ОТКЛОНЕНИЙ
+CORR_THRESHOLD_FACT = 0.80    # Порог тесноты связи по модулю для ФАКТИЧЕСКИХ ЗНАЧЕНИЙ (обычно выше)
 
 # --- НАСТРОЙКИ ФОРМАТА ДАТ ---
 DATE_FORMATS = [
@@ -227,14 +228,13 @@ def visualize_results(data, param, worst_rca_text="", peak_time=None, peak_val=N
     ax2.axhline(0, color='black', linestyle='-', linewidth=0.8)
     ax2.fill_between(plot_data.index, plot_data['Threshold'], -plot_data['Threshold'], color='gray', alpha=0.1)
     
-    # ТЕКСТОВАЯ ВРЕЗКА RCA
+    # ТЕКСТОВАЯ ВРЕЗКА RCA (Отклонения + Факты)
     if worst_rca_text:
         props = dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.9, edgecolor='red')
-        text_str = "🚨 ТОП связанных аномалий:\n" + worst_rca_text
+        text_str = "🚨 ТОП связанных параметров (RCA):\n\n" + worst_rca_text
         ax2.text(1.01, 1.0, text_str, transform=ax2.transAxes, fontsize=10,
                 verticalalignment='top', horizontalalignment='left', bbox=props, color='darkred')
         
-        # Если передан пик, рисуем жирную точку и стрелку
         if peak_time is not None and peak_val is not None:
             ax2.plot(peak_time, peak_val, marker='o', color='darkred', markersize=8, zorder=10)
             ax2.annotate('Пик RCA', xy=(peak_time, peak_val), xytext=(15, 15),
@@ -343,15 +343,16 @@ def main():
             is_exceeded = np.abs(result_df['Deviation']) > result_df['Threshold']
             result_df['Превышение уставки'] = np.where(is_exceeded, 'Да', 'Нет')
             result_df.loc[result_df['Deviation'].isna(), 'Превышение уставки'] = np.nan
-            result_df['Связанные отклонения (RCA)'] = ''
             
-            # Переменные для поиска лучшего (наиболее информативного) пика для графика
+            # Новые колонки для RCA в Excel
+            result_df['Связанные отклонения (RCA)'] = ''
+            result_df['Связанные факты'] = ''
+            
             best_rca_text = ""
             best_rca_time = None
             best_rca_val = None
             max_dev_with_rca = -1
             
-            # Запасной вариант (если ни один пик не найдет связей)
             fallback_rca_text = ""
             fallback_rca_time = None
             fallback_rca_val = None
@@ -374,36 +375,61 @@ def main():
                             
                             peak_idx_num = np.where(all_deviations.index == peak_time)[0][-1]
                             
-                            rca_string = "Недостаточно данных"
-                            rca_items_text = []
+                            rca_dev_string = "Недостаточно данных"
+                            rca_act_string = "Недостаточно данных"
+                            rca_dev_items_text = []
+                            rca_act_items_text = []
                             radar_data = {}
                             
-                            # СТРОГАЯ ПРОВЕРКА ОКНА: если это начало измерений, не считаем
                             if peak_idx_num >= CORR_WINDOW:
                                 win_start = peak_idx_num - CORR_WINDOW + 1
                                 win_end = peak_idx_num + 1
+                                
+                                # Окно для расчета связи по Отклонениям
                                 window_devs = all_deviations.iloc[win_start:win_end]
                                 valid_devs = window_devs.dropna(subset=[param])
                                 
-                                if len(valid_devs) >= CORR_WINDOW * 0.8: # Допускаем до 20% пропусков
-                                    corrs = valid_devs.corrwith(valid_devs[param]).drop(param)
-                                    corrs = corrs[corrs.abs() >= CORR_THRESHOLD].dropna()
+                                # Окно для расчета связи по Фактическим значениям
+                                window_actuals = test_df[predicted_params].iloc[win_start:win_end]
+                                valid_actuals = window_actuals.dropna(subset=[param])
+                                
+                                # 1. Расчет по Отклонениям
+                                if len(valid_devs) >= CORR_WINDOW * 0.8:
+                                    corrs_dev = valid_devs.corrwith(valid_devs[param]).drop(param)
+                                    corrs_dev = corrs_dev[corrs_dev.abs() >= CORR_THRESHOLD].dropna()
                                     
-                                    top_corrs_radar = corrs.abs().sort_values(ascending=False).head(5)
-                                    top_corrs_text = top_corrs_radar.head(3)
+                                    top_corrs_radar = corrs_dev.abs().sort_values(ascending=False).head(5)
+                                    top_corrs_dev_text = top_corrs_radar.head(3)
                                     
                                     if not top_corrs_radar.empty:
-                                        for cp in top_corrs_text.index:
-                                            r_val = corrs[cp]
-                                            rca_items_text.append(f"{cp} (r={r_val:.2f})")
+                                        for cp in top_corrs_dev_text.index:
+                                            r_val = corrs_dev[cp]
+                                            rca_dev_items_text.append(f"{cp} (r={r_val:.2f})")
                                         for cp in top_corrs_radar.index:
-                                            radar_data[cp] = corrs[cp]
+                                            radar_data[cp] = corrs_dev[cp]
                                             
-                                        rca_string = ", ".join(rca_items_text)
+                                        rca_dev_string = ", ".join(rca_dev_items_text)
                                     else:
-                                        rca_string = "Нет сильных связей"
+                                        rca_dev_string = "Нет сильных связей"
+                                        
+                                # 2. Расчет по Фактам
+                                if len(valid_actuals) >= CORR_WINDOW * 0.8:
+                                    corrs_act = valid_actuals.corrwith(valid_actuals[param]).drop(param)
+                                    corrs_act = corrs_act[corrs_act.abs() >= CORR_THRESHOLD_FACT].dropna()
+                                    
+                                    top_corrs_act_text = corrs_act.abs().sort_values(ascending=False).head(3)
+                                    
+                                    if not top_corrs_act_text.empty:
+                                        for cp in top_corrs_act_text.index:
+                                            r_val = corrs_act[cp]
+                                            rca_act_items_text.append(f"{cp} (r={r_val:.2f})")
+                                        rca_act_string = ", ".join(rca_act_items_text)
+                                    else:
+                                        rca_act_string = "Нет сильных связей"
                             
-                            result_df.loc[start_time:end_time, 'Связанные отклонения (RCA)'] = rca_string
+                            # Запись в массивы
+                            result_df.loc[start_time:end_time, 'Связанные отклонения (RCA)'] = rca_dev_string
+                            result_df.loc[start_time:end_time, 'Связанные факты'] = rca_act_string
                             
                             incident_log.append({
                                 'Время начала': start_time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -411,7 +437,8 @@ def main():
                                 'Макс. отклонение': f"{peak_val:.2f}",
                                 'Уставка (3σ)': f"{threshold_val:.2f}",
                                 'Длительность (точек)': duration,
-                                'Связанные отклонения (RCA)': rca_string
+                                'Связанные отклонения (RCA)': rca_dev_string,
+                                'Связанные факты': rca_act_string
                             })
                             
                             if radar_data:
@@ -421,20 +448,35 @@ def main():
                                 
                             # Умный выбор пика для таблички на графике
                             abs_peak = abs(peak_val)
-                            if rca_items_text: # У этого пика ЕСТЬ найденные связи
+                            if rca_dev_items_text or rca_act_items_text:
                                 if abs_peak > max_dev_with_rca:
                                     max_dev_with_rca = abs_peak
-                                    best_rca_text = "\n".join([f"{i+1}. {x}" for i, x in enumerate(rca_items_text)])
+                                    
+                                    text_parts = []
+                                    if rca_dev_items_text:
+                                        text_parts.append("По Отклонениям:")
+                                        text_parts.extend([f"  {i+1}. {x}" for i, x in enumerate(rca_dev_items_text)])
+                                    else:
+                                        text_parts.append("По Отклонениям: Нет")
+                                        
+                                    text_parts.append("") # Пустая строка для отступа
+                                        
+                                    if rca_act_items_text:
+                                        text_parts.append("По Фактам:")
+                                        text_parts.extend([f"  {i+1}. {x}" for i, x in enumerate(rca_act_items_text)])
+                                    else:
+                                        text_parts.append("По Фактам: Нет")
+                                        
+                                    best_rca_text = "\n".join(text_parts)
                                     best_rca_time = peak_time
                                     best_rca_val = peak_val
-                            else: # У этого пика связей нет
+                            else:
                                 if abs_peak > max_dev_no_rca:
                                     max_dev_no_rca = abs_peak
-                                    fallback_rca_text = rca_string
+                                    fallback_rca_text = f"По Отклонениям: {rca_dev_string}\n\nПо Фактам: {rca_act_string}"
                                     fallback_rca_time = peak_time
                                     fallback_rca_val = peak_val
 
-            # Определяем, что в итоге покажем на графике
             if best_rca_time is not None:
                 final_rca_text = best_rca_text
                 final_peak_time = best_rca_time
@@ -465,7 +507,6 @@ def main():
             summary.append([param, f"{mape:.2f}", f"{max_dev:.4f}", f"{mbe:.4f}", f"{rmse:.4f}", f"{r2:.4f}"])
             results[param] = result_df
             
-            # Передаем координаты пика для отрисовки точки
             visualize_results(result_df, param, final_rca_text, final_peak_time, final_peak_val)
             
             for mode in MODES.keys():
