@@ -1,0 +1,603 @@
+# Импорт необходимых библиотек
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
+import seaborn as sns
+from scipy.linalg import pinvh
+from numba import njit, prange
+from tqdm import tqdm
+import warnings
+import logging
+
+# Игнорирование предупреждений для чистоты вывода
+warnings.filterwarnings('ignore')
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ==========================================
+# НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ
+# ==========================================
+TEST_FILE = '260302_Оригинал_тест.csv'  
+OUTPUT_FILE = 'results.xlsx'
+PLOT_FOLDER = 'sbm_plots'
+RCA_FOLDER = 'rca_plots'
+LAG_FOLDER = 'lag_plots'  # <--- Папка для кросс-корреляций (задержек)
+SEPARATOR = ';'
+LAMBDA_REG = 1e-3
+CHUNK_SIZE = 10000
+DPI = 150
+
+# --- НАСТРОЙКИ АНАЛИТИКИ И ДИАГНОСТИКИ ---
+SIGMA_MULTIPLIER = 3.0  # Уставка для "коридора нормы"
+MIN_DURATION = 3        # Минимальная длительность аномалии (в точках) для записи в Журнал инцидентов
+
+# Настройки поиска первопричины (RCA - Root Cause Analysis)
+CORR_WINDOW = 50              # Окно измерений для расчета тесноты связи (последние 50 точек до пика)
+CORR_THRESHOLD = 0.65         # Порог тесноты связи по модулю для ОТКЛОНЕНИЙ
+CORR_THRESHOLD_FACT = 0.80    # Порог тесноты связи по модулю для ФАКТИЧЕСКИХ ЗНАЧЕНИЙ
+
+# Настройки новых инструментов (Скользящая корреляция и Лаги)
+TOP_N_ROLLING = 5             # Для скольки ТОП параметров строить скользящую корреляцию
+MAX_LAG = 15                  # Максимальный временной сдвиг (в точках) для кросс-корреляции
+CROSS_CORR_THRESHOLD = 0.85   # Порог тесноты связи для вывода графика кросс-корреляции
+
+# --- НАСТРОЙКИ ФОРМАТА ДАТ ---
+DATE_FORMATS = [
+    '%d.%m.%Y %H:%M:%S', 
+    '%d.%m.%Y %H:%M',    
+    '%d.%m.%Y',          
+    '%Y-%m-%d %H:%M:%S'  
+]
+
+# --- НАСТРОЙКИ РЕЖИМОВ ---
+MODE_PARAMETER = 'Qmh' 
+
+MODES = {
+    'Режим_Низкая_Нагрузка': {
+        'file': 'train_low_mode.csv',         
+        'condition': lambda x: x < 500        
+    },
+    'Режим_Высокая_Нагрузка': {
+        'file': 'train_high_mode.csv',        
+        'condition': lambda x: x >= 500       
+    }
+}
+# ==========================================
+
+class BigDataProcessor:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.encoding = self._detect_encoding()
+
+    def _detect_encoding(self):
+        encodings_to_try = ['utf-8', 'cp1251', 'latin-1', 'ansi']
+        for enc in encodings_to_try:
+            try:
+                with open(self.file_path, 'r', encoding=enc) as f:
+                    f.read(8192)
+                logging.info(f"[{os.path.basename(self.file_path)}] Кодировка: {enc}")
+                return enc
+            except UnicodeDecodeError:
+                continue
+        return 'utf-8'
+
+    def _count_rows(self):
+        with open(self.file_path, 'r', encoding=self.encoding) as f:
+            return sum(1 for _ in f) - 1 
+
+    def stream_data(self):
+        chunks = []
+        with tqdm(total=self._count_rows(), desc=f"Чтение {os.path.basename(self.file_path)}", unit=' строк', file=sys.stdout) as pbar:
+            for chunk in pd.read_csv(self.file_path, sep=SEPARATOR, chunksize=CHUNK_SIZE, encoding=self.encoding):
+                date_col = chunk.columns[0]
+                date_series = chunk[date_col].astype(str)
+                parsed_dates = pd.Series(pd.NaT, index=chunk.index)
+                
+                if DATE_FORMATS:
+                    for fmt in DATE_FORMATS:
+                        mask = parsed_dates.isna()
+                        if not mask.any(): break
+                        parsed_dates[mask] = pd.to_datetime(date_series[mask], format=fmt, errors='coerce')
+                
+                mask = parsed_dates.isna()
+                if mask.any():
+                    parsed_dates[mask] = pd.to_datetime(date_series[mask], dayfirst=True, errors='coerce')
+                
+                chunk[date_col] = parsed_dates
+                chunk = chunk.dropna(subset=[date_col])
+                chunk = chunk.set_index(date_col)
+                chunks.append(chunk)
+                pbar.update(len(chunk))
+                
+        return pd.concat(chunks)
+
+def preprocess_data(df):
+    string_columns = df.select_dtypes(include=['object']).columns
+    for col in string_columns:
+        df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
+        
+    df = df.apply(pd.to_numeric, errors='coerce')
+    df = df.dropna(axis=1, how='all')
+    df = df.fillna(df.mean())
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(axis=1)
+    return df.astype(np.float32)
+
+class SBMEngine:
+    def __init__(self, train_data, lambda_reg=LAMBDA_REG):
+        self.D = train_data.astype(np.float32)
+        self.M, self.L = self.D.shape
+        self.lambda_reg = lambda_reg
+        self.K_inv = self._compute_similarity_matrix()
+
+    def _compute_similarity_matrix(self):
+        K = similarity_kernel(self.D)
+        K += self.lambda_reg * np.eye(self.M, dtype=np.float32)
+        return pinvh(K).astype(np.float32)
+
+    def predict(self, X):
+        return predict_kernel(self.D, self.K_inv, X.astype(np.float32))
+
+@njit(parallel=True, fastmath=True)
+def similarity_kernel(D):
+    M, L = D.shape
+    K = np.zeros((M, M), dtype=np.float32)
+    for i in prange(M):
+        for j in prange(i + 1):
+            if i == j:
+                K[i, j] = L
+            else:
+                diff = np.abs(D[i] - D[j])
+                K[i, j] = np.sum(1.0 / (1.0 + diff))
+                K[j, i] = K[i, j]
+    return K
+
+@njit(parallel=True, fastmath=True)
+def predict_kernel(D, K_inv, X):
+    predictions = np.zeros((X.shape[0], D.shape[1]), dtype=np.float32)
+    for i in prange(X.shape[0]):
+        x = X[i]
+        diff = np.abs(D - x)
+        similarities = 1.0 / (1.0 + diff)
+        k = np.sum(similarities, axis=1).astype(np.float32)
+        w_hat = K_inv @ k
+        w = w_hat / np.sum(w_hat)
+        w = w.astype(np.float32)
+        D_transposed = D.T.astype(np.float32)
+        predictions[i] = D_transposed @ w
+    return predictions
+
+# ==========================================
+# ФУНКЦИИ ВИЗУАЛИЗАЦИИ
+# ==========================================
+def generate_radar_chart(param, radar_data, safe_param, safe_time, start_time_str):
+    if not radar_data: return
+    
+    labels = list(radar_data.keys())
+    values = [abs(v) for v in radar_data.values()] 
+    actual_r = list(radar_data.values())
+    
+    labels = [param] + labels
+    values = [1.0] + values
+    actual_r = [1.0] + actual_r
+    
+    while len(labels) < 3:
+        labels.append("")
+        values.append(0)
+        actual_r.append(0)
+        
+    N = len(labels)
+    angles = [n / float(N) * 2 * np.pi for n in range(N)]
+    angles += angles[:1]
+    values += values[:1]
+    
+    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+    
+    plt.xticks(angles[:-1], labels, size=9, fontweight='bold')
+    ax.set_rlabel_position(0)
+    plt.yticks([0.25, 0.5, 0.75, 1.0], ["0.25", "0.5", "0.75", "1.0"], color="grey", size=7)
+    plt.ylim(0, 1.05)
+    
+    ax.plot(angles, values, linewidth=2, linestyle='solid', color='red')
+    ax.fill(angles, values, 'red', alpha=0.15)
+    
+    for i, (angle, v, r) in enumerate(zip(angles[:-1], values[:-1], actual_r[:-1])):
+        if labels[i]:
+            ax.text(angle, v + 0.1, f"r={r:.2f}", ha='center', va='center', size=9, color='darkred', 
+                    bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
+            
+    plt.title(f"RCA: {param}\nВремя инцидента: {start_time_str}", size=12, y=1.1, fontweight='bold')
+    
+    plot_path = os.path.join(RCA_FOLDER, f'RCA_{safe_param}_{safe_time}.png')
+    plt.savefig(plot_path, dpi=DPI, bbox_inches='tight')
+    plt.close(fig)
+
+def visualize_results(data, param, worst_rca_text="", peak_time=None, peak_val=None):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
+    plot_data = data.dropna(subset=['Predicted'])
+    
+    ax1.plot(data.index, data['Actual'], label='Фактические значения', color='blue', linewidth=1.5)
+    ax1.plot(plot_data.index, plot_data['Predicted'], '.', label='Прогноз SBM', color='orange', markersize=3)
+    ax1.set_title(f'Параметр: {param}', fontsize=12, fontweight='bold')
+    ax1.legend(loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=10)
+    ax1.grid(alpha=0.3)
+    ax1.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
+
+    ax2.plot(plot_data.index, plot_data['Deviation'], color='red', linewidth=1.0, label='Отклонение')
+    ax2.plot(plot_data.index, plot_data['Threshold'], 'k--', alpha=0.6, label=f'+{SIGMA_MULTIPLIER}σ (Уставка)')
+    ax2.plot(plot_data.index, -plot_data['Threshold'], 'k--', alpha=0.6, label=f'-{SIGMA_MULTIPLIER}σ (Уставка)')
+    ax2.axhline(0, color='black', linestyle='-', linewidth=0.8)
+    ax2.fill_between(plot_data.index, plot_data['Threshold'], -plot_data['Threshold'], color='gray', alpha=0.1)
+    
+    if worst_rca_text:
+        props = dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.9, edgecolor='red')
+        text_str = "🚨 ТОП связанных параметров (RCA):\n\n" + worst_rca_text
+        ax2.text(1.01, 1.0, text_str, transform=ax2.transAxes, fontsize=10,
+                verticalalignment='top', horizontalalignment='left', bbox=props, color='darkred')
+        
+        if peak_time is not None and peak_val is not None:
+            ax2.plot(peak_time, peak_val, marker='o', color='darkred', markersize=8, zorder=10)
+            ax2.annotate('Пик RCA', xy=(peak_time, peak_val), xytext=(15, 15),
+                         textcoords='offset points', arrowprops=dict(arrowstyle='->', color='darkred'),
+                         color='darkred', fontsize=10, fontweight='bold', zorder=10)
+
+    ax2.legend(loc='lower left', bbox_to_anchor=(1.01, 0.0), fontsize=10)
+    ax2.grid(alpha=0.3)
+    ax2.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
+
+    safe_param = str(param).translate(str.maketrans('<>:"/\\|?*', '_________'))
+    plot_path = os.path.join(PLOT_FOLDER, f'{safe_param}.png')
+    plt.savefig(plot_path, dpi=DPI, bbox_inches='tight')
+    plt.close()
+
+def save_output(results, summary, mode_summary, incident_log):
+    with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+        if incident_log:
+            df_incidents = pd.DataFrame(incident_log)
+            df_incidents = df_incidents.sort_values(by='Время начала', ascending=False)
+            df_incidents.to_excel(writer, sheet_name='Журнал инцидентов', index=False)
+        else:
+            pd.DataFrame({"Сообщение": ["Инцидентов не зафиксировано"]}).to_excel(writer, sheet_name='Журнал инцидентов', index=False)
+
+        cols = ['Параметр', 'MAPE(%)', 'Макс. отклонение', 'MBE (Смещение)', 'RMSE', 'R2 (Детерминация)']
+        pd.DataFrame(summary, columns=cols).to_excel(writer, sheet_name='Сводка', index=False)
+        
+        cols_mode = ['Режим', 'Параметр', 'Ср. абсолютная ошибка (MAE)']
+        pd.DataFrame(mode_summary, columns=cols_mode).to_excel(writer, sheet_name='Диагностика по режимам', index=False)
+        
+        for param, df in results.items():
+            safe_sheet_name = str(param).translate(str.maketrans('[]:*?/\\', '_______'))[:31]
+            df.to_excel(writer, sheet_name=safe_sheet_name, index_label='Дата', float_format="%.4f")
+
+# ==========================================
+# ОСНОВНАЯ ФУНКЦИЯ ЗАПУСКА
+# ==========================================
+def main():
+    try:
+        os.makedirs(PLOT_FOLDER, exist_ok=True)
+        os.makedirs(RCA_FOLDER, exist_ok=True)
+        os.makedirs(LAG_FOLDER, exist_ok=True)
+
+        logging.info("\n[1/4] Загрузка тестовой выборки:")
+        test_processor = BigDataProcessor(TEST_FILE)
+        test_df = test_processor.stream_data()
+        test_df = preprocess_data(test_df)
+
+        if MODE_PARAMETER not in test_df.columns:
+            raise ValueError(f"Параметр режима '{MODE_PARAMETER}' не найден в тестовых данных!")
+
+        all_predictions = pd.DataFrame(index=test_df.index, columns=test_df.columns, dtype=np.float32)
+        all_sigmas = pd.DataFrame(index=test_df.index, columns=test_df.columns, dtype=np.float32)
+        mode_tracking = pd.Series('Неизвестно', index=test_df.index)
+
+        logging.info("\n[2/4] и [3/4] Обработка режимов и расчет уставок (СКО параметров):")
+        
+        for mode_name, config in MODES.items():
+            logging.info(f"\n---> Запуск: {mode_name} <---")
+            condition_mask = config['condition'](test_df[MODE_PARAMETER])
+            mode_test_df = test_df[condition_mask]
+            
+            if mode_test_df.empty:
+                continue
+
+            train_file = config['file']
+            if not os.path.exists(train_file):
+                logging.error(f"Файл {train_file} не найден! Пропуск.")
+                continue
+                
+            train_processor = BigDataProcessor(train_file)
+            train_df = train_processor.stream_data()
+            train_df = preprocess_data(train_df)
+
+            common_params = sorted(list(set(train_df.columns) & set(mode_test_df.columns)))
+            train_data = train_df[common_params].values
+            
+            model = SBMEngine(train_data)
+            
+            mode_sigma = np.std(train_data, axis=0)
+            mode_sigma[mode_sigma == 0] = 1e-6 
+
+            mode_preds = model.predict(mode_test_df[common_params].values.astype(np.float32))
+
+            all_predictions.loc[condition_mask, common_params] = mode_preds
+            all_sigmas.loc[condition_mask, common_params] = mode_sigma
+            mode_tracking.loc[condition_mask] = mode_name
+
+        logging.info("\n[4/4] Анализ Первопричин (RCA) и формирование результатов:")
+        
+        predicted_params = [col for col in test_df.columns if all_predictions[col].notna().any()]
+        all_deviations = test_df[predicted_params] - all_predictions[predicted_params]
+        
+        results = {}
+        summary = []
+        mode_summary = []
+        incident_log = []
+        
+        for idx, param in enumerate(tqdm(predicted_params, desc="Анализ и RCA")):
+            result_df = pd.DataFrame({
+                'Actual': test_df[param],
+                'Predicted': all_predictions[param],
+                'Deviation': all_deviations[param],
+                'Threshold': all_sigmas[param] * SIGMA_MULTIPLIER
+            }, index=test_df.index)
+
+            is_exceeded = np.abs(result_df['Deviation']) > result_df['Threshold']
+            result_df['Превышение уставки'] = np.where(is_exceeded, 'Да', 'Нет')
+            result_df.loc[result_df['Deviation'].isna(), 'Превышение уставки'] = np.nan
+            
+            result_df['Связанные отклонения (RCA)'] = ''
+            result_df['Связанные факты'] = ''
+            
+            best_rca_text = ""
+            best_rca_time = None
+            best_rca_val = None
+            max_dev_with_rca = -1
+            
+            fallback_rca_text = ""
+            fallback_rca_time = None
+            fallback_rca_val = None
+            max_dev_no_rca = -1
+
+            if is_exceeded.any():
+                blocks = is_exceeded.astype(int).groupby((is_exceeded != is_exceeded.shift()).cumsum())
+                
+                for block_id, block in blocks:
+                    if block.iloc[0] == 1:
+                        start_time = block.index[0]
+                        end_time = block.index[-1]
+                        duration = len(block)
+                        
+                        if duration > MIN_DURATION:
+                            block_devs = result_df.loc[start_time:end_time, 'Deviation']
+                            peak_time = block_devs.abs().idxmax()
+                            peak_val = block_devs.loc[peak_time]
+                            threshold_val = result_df.loc[peak_time, 'Threshold']
+                            
+                            peak_idx_num = np.where(all_deviations.index == peak_time)[0][-1]
+                            
+                            rca_dev_string = "Недостаточно данных"
+                            rca_act_string = "Недостаточно данных"
+                            rca_dev_items_text = []
+                            rca_act_items_text = []
+                            radar_data = {}
+                            
+                            if peak_idx_num >= CORR_WINDOW:
+                                win_start = peak_idx_num - CORR_WINDOW + 1
+                                win_end = peak_idx_num + 1
+                                
+                                window_devs = all_deviations.iloc[win_start:win_end]
+                                valid_devs = window_devs.dropna(subset=[param])
+                                
+                                window_actuals = test_df[predicted_params].iloc[win_start:win_end]
+                                valid_actuals = window_actuals.dropna(subset=[param])
+                                
+                                if len(valid_devs) >= CORR_WINDOW * 0.8:
+                                    corrs_dev = valid_devs.corrwith(valid_devs[param]).drop(param)
+                                    corrs_dev = corrs_dev[corrs_dev.abs() >= CORR_THRESHOLD].dropna()
+                                    
+                                    top_corrs_radar = corrs_dev.abs().sort_values(ascending=False).head(5)
+                                    top_corrs_dev_text = top_corrs_radar.head(3)
+                                    
+                                    if not top_corrs_radar.empty:
+                                        for cp in top_corrs_dev_text.index:
+                                            r_val = corrs_dev[cp]
+                                            rca_dev_items_text.append(f"{cp} (r={r_val:.2f})")
+                                        for cp in top_corrs_radar.index:
+                                            radar_data[cp] = corrs_dev[cp]
+                                        rca_dev_string = ", ".join(rca_dev_items_text)
+                                    else:
+                                        rca_dev_string = "Нет сильных связей"
+                                        
+                                if len(valid_actuals) >= CORR_WINDOW * 0.8:
+                                    corrs_act = valid_actuals.corrwith(valid_actuals[param]).drop(param)
+                                    corrs_act = corrs_act[corrs_act.abs() >= CORR_THRESHOLD_FACT].dropna()
+                                    
+                                    top_corrs_act_text = corrs_act.abs().sort_values(ascending=False).head(3)
+                                    
+                                    if not top_corrs_act_text.empty:
+                                        for cp in top_corrs_act_text.index:
+                                            r_val = corrs_act[cp]
+                                            rca_act_items_text.append(f"{cp} (r={r_val:.2f})")
+                                        rca_act_string = ", ".join(rca_act_items_text)
+                                    else:
+                                        rca_act_string = "Нет сильных связей"
+                            
+                            result_df.loc[start_time:end_time, 'Связанные отклонения (RCA)'] = rca_dev_string
+                            result_df.loc[start_time:end_time, 'Связанные факты'] = rca_act_string
+                            
+                            incident_log.append({
+                                'Время начала': start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                                'Параметр': param,
+                                'Макс. отклонение': f"{peak_val:.2f}",
+                                'Уставка (3σ)': f"{threshold_val:.2f}",
+                                'Длительность (точек)': duration,
+                                'Связанные отклонения (RCA)': rca_dev_string,
+                                'Связанные факты': rca_act_string
+                            })
+                            
+                            if radar_data:
+                                safe_param = str(param).translate(str.maketrans('<>:"/\\|?*', '_________'))
+                                safe_time = start_time.strftime("%Y%m%d_%H%M%S")
+                                generate_radar_chart(param, radar_data, safe_param, safe_time, start_time.strftime('%Y-%m-%d %H:%M:%S'))
+                                
+                            abs_peak = abs(peak_val)
+                            if rca_dev_items_text or rca_act_items_text:
+                                if abs_peak > max_dev_with_rca:
+                                    max_dev_with_rca = abs_peak
+                                    
+                                    text_parts = []
+                                    if rca_dev_items_text:
+                                        text_parts.append("По Отклонениям:")
+                                        text_parts.extend([f"  {i+1}. {x}" for i, x in enumerate(rca_dev_items_text)])
+                                    else:
+                                        text_parts.append("По Отклонениям: Нет")
+                                        
+                                    text_parts.append("")
+                                        
+                                    if rca_act_items_text:
+                                        text_parts.append("По Фактам:")
+                                        text_parts.extend([f"  {i+1}. {x}" for i, x in enumerate(rca_act_items_text)])
+                                    else:
+                                        text_parts.append("По Фактам: Нет")
+                                        
+                                    best_rca_text = "\n".join(text_parts)
+                                    best_rca_time = peak_time
+                                    best_rca_val = peak_val
+                            else:
+                                if abs_peak > max_dev_no_rca:
+                                    max_dev_no_rca = abs_peak
+                                    fallback_rca_text = f"По Отклонениям: {rca_dev_string}\n\nПо Фактам: {rca_act_string}"
+                                    fallback_rca_time = peak_time
+                                    fallback_rca_val = peak_val
+
+            if best_rca_time is not None:
+                final_rca_text = best_rca_text
+                final_peak_time = best_rca_time
+                final_peak_val = best_rca_val
+            elif fallback_rca_time is not None:
+                final_rca_text = fallback_rca_text
+                final_peak_time = fallback_rca_time
+                final_peak_val = fallback_rca_val
+            else:
+                final_rca_text = ""
+                final_peak_time = None
+                final_peak_val = None
+
+            valid_data = result_df.dropna(subset=['Predicted'])
+            
+            if not valid_data.empty:
+                mask = valid_data['Actual'] != 0
+                mape = (np.abs(valid_data['Deviation'][mask]) / np.abs(valid_data['Actual'][mask])).mean() * 100
+                max_dev = valid_data['Deviation'].abs().max()
+                mbe = valid_data['Deviation'].mean()
+                rmse = np.sqrt((valid_data['Deviation'] ** 2).mean())
+                ss_res = (valid_data['Deviation'] ** 2).sum()
+                ss_tot = ((valid_data['Actual'] - valid_data['Actual'].mean()) ** 2).sum()
+                r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+            else:
+                mape, max_dev, mbe, rmse, r2 = 0.0, 0.0, 0.0, 0.0, 0.0
+
+            summary.append([param, f"{mape:.2f}", f"{max_dev:.4f}", f"{mbe:.4f}", f"{rmse:.4f}", f"{r2:.4f}"])
+            results[param] = result_df
+            
+            visualize_results(result_df, param, final_rca_text, final_peak_time, final_peak_val)
+            
+            for mode in MODES.keys():
+                mask_mode = (mode_tracking == mode) & result_df['Deviation'].notna()
+                if mask_mode.any():
+                    mae_mode = np.abs(result_df.loc[mask_mode, 'Deviation']).mean()
+                    mode_summary.append([mode, param, f"{mae_mode:.4f}"])
+
+        # ==========================================
+        # НОВЫЙ БЛОК: ТЕПЛОВЫЕ КАРТЫ
+        # ==========================================
+        logging.info("Построение тепловых карт корреляции (Матрицы)...")
+        plt.figure(figsize=(14, 12))
+        sns.heatmap(all_deviations.corr(), cmap='coolwarm', vmin=-1, vmax=1)
+        plt.title('Тепловая карта корреляции ОТКЛОНЕНИЙ', fontsize=14)
+        plt.savefig(os.path.join(PLOT_FOLDER, '00_Heatmap_Deviations_Corr.png'), dpi=DPI, bbox_inches='tight')
+        plt.close()
+
+        plt.figure(figsize=(14, 12))
+        sns.heatmap(test_df[predicted_params].corr(), cmap='coolwarm', vmin=-1, vmax=1)
+        plt.title('Тепловая карта корреляции ФАКТИЧЕСКИХ ЗНАЧЕНИЙ', fontsize=14)
+        plt.savefig(os.path.join(PLOT_FOLDER, '00_Heatmap_Actuals_Corr.png'), dpi=DPI, bbox_inches='tight')
+        plt.close()
+
+        # ==========================================
+        # НОВЫЙ БЛОК: СКОЛЬЗЯЩАЯ КОРРЕЛЯЦИЯ (Rolling Corr)
+        # ==========================================
+        logging.info(f"Построение графиков скользящей корреляции для ТОП-{TOP_N_ROLLING} аномалий...")
+        # Находим ТОП параметров с наибольшим максимальным отклонением за весь период
+        top_params = all_deviations.abs().max().nlargest(TOP_N_ROLLING).index
+        for param in top_params:
+            corrs = all_deviations.corrwith(all_deviations[param]).drop(param)
+            if not corrs.empty and not corrs.isna().all():
+                best_pair = corrs.abs().idxmax()
+                # Считаем скользящую корреляцию
+                rolling_c = all_deviations[param].rolling(window=CORR_WINDOW).corr(all_deviations[best_pair])
+                
+                fig, ax = plt.subplots(figsize=(14, 4))
+                ax.plot(rolling_c.index, rolling_c, color='purple', label=f'Скользящая корреляция (окно {CORR_WINDOW})')
+                ax.axhline(CORR_THRESHOLD, color='red', linestyle='--', alpha=0.5, label='Порог RCA')
+                ax.axhline(-CORR_THRESHOLD, color='red', linestyle='--', alpha=0.5)
+                ax.set_title(f'Связь во времени (Отклонения): {param} и {best_pair}', fontsize=12)
+                ax.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
+                ax.legend(loc='upper left')
+                ax.grid(True, alpha=0.3)
+                
+                safe_p1 = str(param).translate(str.maketrans('<>:"/\\|?*', '_________'))
+                safe_p2 = str(best_pair).translate(str.maketrans('<>:"/\\|?*', '_________'))
+                plt.savefig(os.path.join(RCA_FOLDER, f'Rolling_Corr_{safe_p1}_vs_{safe_p2}.png'), dpi=DPI, bbox_inches='tight')
+                plt.close()
+
+        # ==========================================
+        # НОВЫЙ БЛОК: КРОСС-КОРРЕЛЯЦИЯ (Поиск задержек)
+        # ==========================================
+        logging.info("Анализ временных задержек (Кросс-коррелограммы)...")
+        cols = predicted_params
+        for i in tqdm(range(len(cols)), desc="Анализ задержек"):
+            for j in range(i + 1, len(cols)):
+                col1, col2 = cols[i], cols[j]
+                
+                s1 = test_df[col1]
+                s2 = test_df[col2]
+                
+                lags = range(-MAX_LAG, MAX_LAG + 1)
+                cross_corrs = [s1.corr(s2.shift(lag)) for lag in lags]
+                cross_corrs = np.nan_to_num(np.array(cross_corrs))
+                
+                max_corr_idx = np.argmax(np.abs(cross_corrs))
+                best_val = cross_corrs[max_corr_idx]
+                best_lag = lags[max_corr_idx]
+                
+                # Если найдена сильная связь со сдвигом - рисуем график
+                if abs(best_val) >= CROSS_CORR_THRESHOLD:
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    ax.bar(lags, cross_corrs, color='steelblue')
+                    ax.axhline(CROSS_CORR_THRESHOLD, color='red', linestyle='--', label='Порог')
+                    ax.axhline(-CROSS_CORR_THRESHOLD, color='red', linestyle='--')
+                    ax.set_title(f'Кросс-корреляция (Факты): {col1} vs {col2}\nМакс. связь (r={best_val:.2f}) при сдвиге {best_lag} тактов')
+                    ax.set_xlabel('Временной сдвиг (в строках)')
+                    ax.set_ylabel('Коэффициент корреляции Пирсона')
+                    ax.legend()
+                    ax.grid(alpha=0.3)
+                    
+                    safe_c1 = str(col1).translate(str.maketrans('<>:"/\\|?*', '_________'))
+                    safe_c2 = str(col2).translate(str.maketrans('<>:"/\\|?*', '_________'))
+                    plt.savefig(os.path.join(LAG_FOLDER, f'CrossCorr_{safe_c1}_vs_{safe_c2}.png'), dpi=DPI, bbox_inches='tight')
+                    plt.close()
+
+        save_output(results, summary, mode_summary, incident_log)
+        logging.info(f"\nАнализ полностью завершен! Сохранено в {OUTPUT_FILE}.")
+
+    except Exception as e:
+        logging.error(f"\nКритическая ошибка: {str(e)}")
+
+if __name__ == "__main__":
+    main()
