@@ -24,18 +24,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 TEST_FILE = '260302_Оригинал_тест.csv'  
 OUTPUT_FILE = 'results.xlsx'
 PLOT_FOLDER = 'sbm_plots'
-RCA_FOLDER = 'rca_plots' # <--- НОВАЯ ПАПКА ДЛЯ РАДАРОВ
+RCA_FOLDER = 'rca_plots'
 SEPARATOR = ';'
 LAMBDA_REG = 1e-3
 CHUNK_SIZE = 10000
 DPI = 150
 
 # --- НАСТРОЙКИ АНАЛИТИКИ И ДИАГНОСТИКИ ---
-SIGMA_MULTIPLIER = 3.0  # Уставка для расчета "коридора нормы" (правило 3-х сигм)
+SIGMA_MULTIPLIER = 3.0  # Уставка для "коридора нормы"
+MIN_DURATION = 3        # Минимальная длительность аномалии (в точках) для записи в Журнал инцидентов
 
 # Настройки поиска первопричины (RCA - Root Cause Analysis)
-CORR_WINDOW = 50        # Окно измерений для расчета тесноты связи (последние 50 точек)
-CORR_THRESHOLD = 0.75   # Минимальный модуль корреляции для признания связи сильной
+CORR_WINDOW = 50        # Окно измерений для расчета тесноты связи (последние 50 точек до пика)
+CORR_THRESHOLD = 0.65   # Порог тесноты связи по модулю (снижен для остатков, т.к. они более зашумлены)
 
 # --- НАСТРОЙКИ ФОРМАТА ДАТ ---
 DATE_FORMATS = [
@@ -166,19 +167,16 @@ def predict_kernel(D, K_inv, X):
 # ФУНКЦИИ ВИЗУАЛИЗАЦИИ
 # ==========================================
 def generate_radar_chart(param, radar_data, safe_param, safe_time, start_time_str):
-    """Генерация лепестковой диаграммы для связанных аномалий (Вариант Б)"""
     if not radar_data: return
     
     labels = list(radar_data.keys())
     values = [abs(v) for v in radar_data.values()] 
     actual_r = list(radar_data.values())
     
-    # Добавляем исходный параметр в центр (r=1.0)
     labels = [param] + labels
     values = [1.0] + values
     actual_r = [1.0] + actual_r
     
-    # Добиваем до 3 осей, чтобы радар нарисовался корректно, если связей мало
     while len(labels) < 3:
         labels.append("")
         values.append(0)
@@ -213,14 +211,13 @@ def generate_radar_chart(param, radar_data, safe_param, safe_time, start_time_st
     plt.close(fig)
 
 def visualize_results(data, param, worst_rca_text=""):
-    """Стандартный график с текстовой врезкой RCA (Вариант А)"""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
     plot_data = data.dropna(subset=['Predicted'])
     
     ax1.plot(data.index, data['Actual'], label='Фактические значения', color='blue', linewidth=1.5)
     ax1.plot(plot_data.index, plot_data['Predicted'], '.', label='Прогноз SBM', color='orange', markersize=3)
     ax1.set_title(f'Параметр: {param}', fontsize=12, fontweight='bold')
-    ax1.legend(loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=10) # Легенда вынесена вправо
+    ax1.legend(loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=10)
     ax1.grid(alpha=0.3)
     ax1.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
 
@@ -230,14 +227,15 @@ def visualize_results(data, param, worst_rca_text=""):
     ax2.axhline(0, color='black', linestyle='-', linewidth=0.8)
     ax2.fill_between(plot_data.index, plot_data['Threshold'], -plot_data['Threshold'], color='gray', alpha=0.1)
     
-    # ТЕКСТОВАЯ ВРЕЗКА RCA (Вариант А)
+    # ТЕКСТОВАЯ ВРЕЗКА RCA (Вынесена вправо, чтобы не перекрывать график)
     if worst_rca_text:
         props = dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.9, edgecolor='red')
-        text_str = "🚨 ТОП связанных аномалий (RCA):\n" + worst_rca_text
-        ax2.text(0.01, 0.95, text_str, transform=ax2.transAxes, fontsize=10,
-                verticalalignment='top', bbox=props, color='darkred')
+        text_str = "🚨 ТОП связанных аномалий:\n" + worst_rca_text
+        ax2.text(1.01, 1.0, text_str, transform=ax2.transAxes, fontsize=10,
+                verticalalignment='top', horizontalalignment='left', bbox=props, color='darkred')
 
-    ax2.legend(loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=10) # Легенда вынесена вправо
+    # Опускаем легенду вниз
+    ax2.legend(loc='lower left', bbox_to_anchor=(1.01, 0.0), fontsize=10)
     ax2.grid(alpha=0.3)
     ax2.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
 
@@ -247,26 +245,20 @@ def visualize_results(data, param, worst_rca_text=""):
     plt.close()
 
 def save_output(results, summary, mode_summary, incident_log):
-    """Сохранение результатов с Журналом Инцидентов"""
     with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
-        # 1. Журнал инцидентов
         if incident_log:
             df_incidents = pd.DataFrame(incident_log)
-            # Сортировка по времени
             df_incidents = df_incidents.sort_values(by='Время начала', ascending=False)
             df_incidents.to_excel(writer, sheet_name='Журнал инцидентов', index=False)
         else:
             pd.DataFrame({"Сообщение": ["Инцидентов не зафиксировано"]}).to_excel(writer, sheet_name='Журнал инцидентов', index=False)
 
-        # 2. Сводка
         cols = ['Параметр', 'MAPE(%)', 'Макс. отклонение', 'MBE (Смещение)', 'RMSE', 'R2 (Детерминация)']
         pd.DataFrame(summary, columns=cols).to_excel(writer, sheet_name='Сводка', index=False)
         
-        # 3. Диагностика по режимам
         cols_mode = ['Режим', 'Параметр', 'Ср. абсолютная ошибка (MAE)']
         pd.DataFrame(mode_summary, columns=cols_mode).to_excel(writer, sheet_name='Диагностика по режимам', index=False)
         
-        # 4. Листы с параметрами
         for param, df in results.items():
             safe_sheet_name = str(param).translate(str.maketrans('[]:*?/\\', '_______'))[:31]
             df.to_excel(writer, sheet_name=safe_sheet_name, index_label='Дата', float_format="%.4f")
@@ -277,7 +269,7 @@ def save_output(results, summary, mode_summary, incident_log):
 def main():
     try:
         os.makedirs(PLOT_FOLDER, exist_ok=True)
-        os.makedirs(RCA_FOLDER, exist_ok=True) # Папка для радаров
+        os.makedirs(RCA_FOLDER, exist_ok=True)
 
         logging.info("\n[1/4] Загрузка тестовой выборки:")
         test_processor = BigDataProcessor(TEST_FILE)
@@ -313,14 +305,11 @@ def main():
             common_params = sorted(list(set(train_df.columns) & set(mode_test_df.columns)))
             train_data = train_df[common_params].values
             
-            logging.info("Обучение модели и вычисление СКО параметра (σ)...")
             model = SBMEngine(train_data)
             
-            # РАСЧЕТ УСТАВОК ПО НОВОМУ (СКО самого параметра)
             mode_sigma = np.std(train_data, axis=0)
             mode_sigma[mode_sigma == 0] = 1e-6 
 
-            logging.info("Прогнозирование...")
             mode_preds = model.predict(mode_test_df[common_params].values.astype(np.float32))
 
             all_predictions.loc[condition_mask, common_params] = mode_preds
@@ -330,8 +319,6 @@ def main():
         logging.info("\n[4/4] Анализ Первопричин (RCA) и формирование результатов:")
         
         predicted_params = [col for col in test_df.columns if all_predictions[col].notna().any()]
-        
-        # Матрица отклонений для поиска корреляций RCA
         all_deviations = test_df[predicted_params] - all_predictions[predicted_params]
         
         results = {}
@@ -347,7 +334,6 @@ def main():
                 'Threshold': all_sigmas[param] * SIGMA_MULTIPLIER
             }, index=test_df.index)
 
-            # ДОБАВЛЕНИЕ СТОЛБЦОВ RCA
             is_exceeded = np.abs(result_df['Deviation']) > result_df['Threshold']
             result_df['Превышение уставки'] = np.where(is_exceeded, 'Да', 'Нет')
             result_df.loc[result_df['Deviation'].isna(), 'Превышение уставки'] = np.nan
@@ -356,76 +342,77 @@ def main():
             worst_rca_text = ""
             max_dev_overall = -1
 
-            # Поиск инцидентов и расчет RCA
             if is_exceeded.any():
-                # Группировка подряд идущих "Да" в единые блоки инцидентов
                 blocks = is_exceeded.astype(int).groupby((is_exceeded != is_exceeded.shift()).cumsum())
                 
                 for block_id, block in blocks:
-                    if block.iloc[0] == 1: # Это блок аномалии
+                    if block.iloc[0] == 1:
                         start_time = block.index[0]
                         end_time = block.index[-1]
                         duration = len(block)
                         
-                        # Ищем пик внутри инцидента
-                        block_devs = result_df.loc[start_time:end_time, 'Deviation']
-                        peak_time = block_devs.abs().idxmax()
-                        peak_val = block_devs.loc[peak_time]
-                        threshold_val = result_df.loc[peak_time, 'Threshold']
-                        
-                        # Выделяем окно для расчета корреляций (до пика)
-                        peak_idx_num = all_deviations.index.get_loc(peak_time)
-                        win_start = max(0, peak_idx_num - CORR_WINDOW + 1)
-                        win_end = peak_idx_num + 1
-                        window_devs = all_deviations.iloc[win_start:win_end]
-                        
-                        rca_string = "Недостаточно данных"
-                        rca_items_text = []
-                        radar_data = {}
-                        
-                        if len(window_devs) > 3: # Нужно хоть немного точек для корреляции
-                            corrs = window_devs.corrwith(window_devs[param]).drop(param)
-                            corrs = corrs[corrs.abs() >= CORR_THRESHOLD].dropna()
+                        # ---> ФИЛЬТР: Отсекаем все инциденты короче MIN_DURATION <---
+                        if duration > MIN_DURATION:
+                            block_devs = result_df.loc[start_time:end_time, 'Deviation']
+                            peak_time = block_devs.abs().idxmax()
+                            peak_val = block_devs.loc[peak_time]
+                            threshold_val = result_df.loc[peak_time, 'Threshold']
                             
-                            # ТОП-5 для Радара (Вариант Б)
-                            top_corrs_radar = corrs.abs().sort_values(ascending=False).head(5)
-                            # ТОП-3 для Текста и Excel (Вариант А)
-                            top_corrs_text = top_corrs_radar.head(3)
+                            # Безопасный поиск индекса пика
+                            peak_idx_num = np.where(all_deviations.index == peak_time)[0][-1]
+                            win_start = max(0, peak_idx_num - CORR_WINDOW + 1)
+                            win_end = peak_idx_num + 1
+                            window_devs = all_deviations.iloc[win_start:win_end]
                             
-                            if not top_corrs_radar.empty:
-                                for cp in top_corrs_text.index:
-                                    r_val = corrs[cp]
-                                    rca_items_text.append(f"{cp} (r={r_val:.2f})")
-                                for cp in top_corrs_radar.index:
-                                    radar_data[cp] = corrs[cp]
-                                    
-                                rca_string = ", ".join(rca_items_text)
-                            else:
-                                rca_string = "Нет сильных связей"
-                        
-                        # Записываем RCA в DataFrame параметра
-                        result_df.loc[start_time:end_time, 'Связанные отклонения (RCA)'] = rca_string
-                        
-                        # Пишем в Журнал инцидентов
-                        incident_log.append({
-                            'Время начала': start_time.strftime('%Y-%m-%d %H:%M:%S'),
-                            'Параметр': param,
-                            'Макс. отклонение': f"{peak_val:.2f}",
-                            'Уставка (3σ)': f"{threshold_val:.2f}",
-                            'Длительность (точек)': duration,
-                            'Связанные отклонения (RCA)': rca_string
-                        })
-                        
-                        # Отрисовка радара для значимых инцидентов
-                        if radar_data:
-                            safe_param = str(param).translate(str.maketrans('<>:"/\\|?*', '_________'))
-                            safe_time = start_time.strftime("%Y%m%d_%H%M%S")
-                            generate_radar_chart(param, radar_data, safe_param, safe_time, start_time.strftime('%Y-%m-%d %H:%M:%S'))
+                            # Убираем NaN, чтобы корреляция посчиталась правильно
+                            valid_devs = window_devs.dropna(subset=[param])
                             
-                        # Запоминаем худший инцидент для Варианта А (текст на графике)
-                        if abs(peak_val) > max_dev_overall:
-                            max_dev_overall = abs(peak_val)
-                            worst_rca_text = "\n".join([f"{i+1}. {x}" for i, x in enumerate(rca_items_text)]) if rca_items_text else "Нет сильных связей"
+                            rca_string = "Недостаточно данных"
+                            rca_items_text = []
+                            radar_data = {}
+                            
+                            if len(valid_devs) > 5:
+                                corrs = valid_devs.corrwith(valid_devs[param]).drop(param)
+                                corrs = corrs[corrs.abs() >= CORR_THRESHOLD].dropna()
+                                
+                                top_corrs_radar = corrs.abs().sort_values(ascending=False).head(5)
+                                top_corrs_text = top_corrs_radar.head(3)
+                                
+                                if not top_corrs_radar.empty:
+                                    for cp in top_corrs_text.index:
+                                        r_val = corrs[cp]
+                                        rca_items_text.append(f"{cp} (r={r_val:.2f})")
+                                    for cp in top_corrs_radar.index:
+                                        radar_data[cp] = corrs[cp]
+                                        
+                                    rca_string = ", ".join(rca_items_text)
+                                else:
+                                    rca_string = "Нет сильных связей"
+                            
+                            result_df.loc[start_time:end_time, 'Связанные отклонения (RCA)'] = rca_string
+                            
+                            incident_log.append({
+                                'Время начала': start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                                'Параметр': param,
+                                'Макс. отклонение': f"{peak_val:.2f}",
+                                'Уставка (3σ)': f"{threshold_val:.2f}",
+                                'Длительность (точек)': duration,
+                                'Связанные отклонения (RCA)': rca_string
+                            })
+                            
+                            if radar_data:
+                                safe_param = str(param).translate(str.maketrans('<>:"/\\|?*', '_________'))
+                                safe_time = start_time.strftime("%Y%m%d_%H%M%S")
+                                generate_radar_chart(param, radar_data, safe_param, safe_time, start_time.strftime('%Y-%m-%d %H:%M:%S'))
+                                
+                            if abs(peak_val) > max_dev_overall:
+                                max_dev_overall = abs(peak_val)
+                                if rca_string == "Недостаточно данных":
+                                    worst_rca_text = "Недостаточно данных"
+                                elif rca_items_text:
+                                    worst_rca_text = "\n".join([f"{i+1}. {x}" for i, x in enumerate(rca_items_text)])
+                                else:
+                                    worst_rca_text = "Нет сильных связей"
 
             valid_data = result_df.dropna(subset=['Predicted'])
             
@@ -444,19 +431,13 @@ def main():
             summary.append([param, f"{mape:.2f}", f"{max_dev:.4f}", f"{mbe:.4f}", f"{rmse:.4f}", f"{r2:.4f}"])
             results[param] = result_df
             
-            # Рисуем график с Вариантом А (врезка) и вынесенной легендой (Проф. вариант 2)
             visualize_results(result_df, param, worst_rca_text)
             
-            # Аналитика по режимам
             for mode in MODES.keys():
                 mask_mode = (mode_tracking == mode) & result_df['Deviation'].notna()
                 if mask_mode.any():
                     mae_mode = np.abs(result_df.loc[mask_mode, 'Deviation']).mean()
                     mode_summary.append([mode, param, f"{mae_mode:.4f}"])
-
-        # Индекс технического состояния и Heatmap (оставляем как было, просто вызываем расчет)
-        # (Код тепловой карты и Индекса здоровья сокращен для чистоты, они работают как и раньше
-        # Если нужно вернуть их построение в main - сообщите, но суть задачи была именно в RCA)
 
         save_output(results, summary, mode_summary, incident_log)
         logging.info(f"\nАнализ завершен! Журнал инцидентов сохранен в {OUTPUT_FILE}.")
