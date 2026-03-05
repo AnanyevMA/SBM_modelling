@@ -25,7 +25,7 @@ TEST_FILE = '260302_Оригинал_тест.csv'
 OUTPUT_FILE = 'results.xlsx'
 PLOT_FOLDER = 'sbm_plots'
 RCA_FOLDER = 'rca_plots'
-LAG_FOLDER = 'lag_plots'  # <--- Папка для кросс-корреляций (задержек)
+LAG_FOLDER = 'lag_plots'
 SEPARATOR = ';'
 LAMBDA_REG = 1e-3
 CHUNK_SIZE = 10000
@@ -173,7 +173,7 @@ def predict_kernel(D, K_inv, X):
 # ==========================================
 # ФУНКЦИИ ВИЗУАЛИЗАЦИИ
 # ==========================================
-def generate_radar_chart(param, radar_data, safe_param, safe_time, start_time_str):
+def generate_radar_chart(param, radar_data, safe_param, safe_time, start_time_str, title_prefix="RCA"):
     if not radar_data: return
     
     labels = list(radar_data.keys())
@@ -203,21 +203,23 @@ def generate_radar_chart(param, radar_data, safe_param, safe_time, start_time_st
     plt.yticks([0.25, 0.5, 0.75, 1.0], ["0.25", "0.5", "0.75", "1.0"], color="grey", size=7)
     plt.ylim(0, 1.05)
     
-    ax.plot(angles, values, linewidth=2, linestyle='solid', color='red')
-    ax.fill(angles, values, 'red', alpha=0.15)
+    color = 'red' if 'Отклонения' in title_prefix else 'blue'
+    ax.plot(angles, values, linewidth=2, linestyle='solid', color=color)
+    ax.fill(angles, values, color, alpha=0.15)
     
     for i, (angle, v, r) in enumerate(zip(angles[:-1], values[:-1], actual_r[:-1])):
         if labels[i]:
             ax.text(angle, v + 0.1, f"r={r:.2f}", ha='center', va='center', size=9, color='darkred', 
                     bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
             
-    plt.title(f"RCA: {param}\nВремя инцидента: {start_time_str}", size=12, y=1.1, fontweight='bold')
+    plt.title(f"{title_prefix}: {param}\nВремя: {start_time_str}", size=12, y=1.1, fontweight='bold')
     
-    plot_path = os.path.join(RCA_FOLDER, f'RCA_{safe_param}_{safe_time}.png')
+    prefix_file = "RCA_Dev" if 'Отклонения' in title_prefix else "RCA_Act"
+    plot_path = os.path.join(RCA_FOLDER, f'{prefix_file}_{safe_param}_{safe_time}.png')
     plt.savefig(plot_path, dpi=DPI, bbox_inches='tight')
     plt.close(fig)
 
-def visualize_results(data, param, worst_rca_text="", peak_time=None, peak_val=None):
+def visualize_results(data, param, worst_rca_text="", peak_time_dev=None, peak_val_dev=None, peak_time_act=None, peak_val_act=None):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
     plot_data = data.dropna(subset=['Predicted'])
     
@@ -240,11 +242,20 @@ def visualize_results(data, param, worst_rca_text="", peak_time=None, peak_val=N
         ax2.text(1.01, 1.0, text_str, transform=ax2.transAxes, fontsize=10,
                 verticalalignment='top', horizontalalignment='left', bbox=props, color='darkred')
         
-        if peak_time is not None and peak_val is not None:
-            ax2.plot(peak_time, peak_val, marker='o', color='darkred', markersize=8, zorder=10)
-            ax2.annotate('Пик RCA', xy=(peak_time, peak_val), xytext=(15, 15),
+        # Точка 1: Пик Отклонений
+        if peak_time_dev is not None and peak_val_dev is not None:
+            ax2.plot(peak_time_dev, peak_val_dev, marker='o', color='darkred', markersize=8, zorder=10)
+            ax2.annotate('Пик Отклонений RCA', xy=(peak_time_dev, peak_val_dev), xytext=(15, 15),
                          textcoords='offset points', arrowprops=dict(arrowstyle='->', color='darkred'),
                          color='darkred', fontsize=10, fontweight='bold', zorder=10)
+                         
+        # Точка 2: Пик Фактов (размещаем на ax2 по величине отклонения в тот момент времени)
+        if peak_time_act is not None and peak_val_act is not None:
+            # Сдвинем текст аннотации, чтобы стрелки не сливались, если пики близко
+            ax2.plot(peak_time_act, peak_val_act, marker='o', color='darkblue', markersize=8, zorder=10)
+            ax2.annotate('Пик Фактов RCA', xy=(peak_time_act, peak_val_act), xytext=(15, -25),
+                         textcoords='offset points', arrowprops=dict(arrowstyle='->', color='darkblue'),
+                         color='darkblue', fontsize=10, fontweight='bold', zorder=10)
 
     ax2.legend(loc='lower left', bbox_to_anchor=(1.01, 0.0), fontsize=10)
     ax2.grid(alpha=0.3)
@@ -354,13 +365,15 @@ def main():
             result_df['Связанные факты'] = ''
             
             best_rca_text = ""
-            best_rca_time = None
-            best_rca_val = None
+            best_rca_time_dev = None
+            best_rca_val_dev = None
+            best_rca_time_act = None
+            best_rca_val_act = None
             max_dev_with_rca = -1
             
             fallback_rca_text = ""
-            fallback_rca_time = None
-            fallback_rca_val = None
+            fallback_rca_time_dev = None
+            fallback_rca_val_dev = None
             max_dev_no_rca = -1
 
             if is_exceeded.any():
@@ -373,28 +386,34 @@ def main():
                         duration = len(block)
                         
                         if duration > MIN_DURATION:
+                            # НЕЗАВИСИМЫЙ ПОИСК ПИКОВ ВНУТРИ АНОМАЛИИ
+                            # 1. Пик по Отклонениям (макс. ошибка модели)
                             block_devs = result_df.loc[start_time:end_time, 'Deviation']
-                            peak_time = block_devs.abs().idxmax()
-                            peak_val = block_devs.loc[peak_time]
-                            threshold_val = result_df.loc[peak_time, 'Threshold']
+                            peak_time_dev = block_devs.abs().idxmax()
+                            peak_val_dev = block_devs.loc[peak_time_dev]
+                            threshold_val = result_df.loc[peak_time_dev, 'Threshold']
                             
-                            peak_idx_num = np.where(all_deviations.index == peak_time)[0][-1]
+                            # 2. Пик по Фактам (макс. абсолютное физическое значение)
+                            block_acts = result_df.loc[start_time:end_time, 'Actual']
+                            peak_time_act = block_acts.abs().idxmax()
+                            peak_val_act = result_df.loc[peak_time_act, 'Deviation'] # Для отображения на ax2 берем дельту в этот момент
+                            
+                            peak_idx_num_dev = np.where(all_deviations.index == peak_time_dev)[0][-1]
+                            peak_idx_num_act = np.where(all_deviations.index == peak_time_act)[0][-1]
                             
                             rca_dev_string = "Недостаточно данных"
                             rca_act_string = "Недостаточно данных"
                             rca_dev_items_text = []
                             rca_act_items_text = []
-                            radar_data = {}
+                            radar_data_dev = {}
+                            radar_data_act = {}
                             
-                            if peak_idx_num >= CORR_WINDOW:
-                                win_start = peak_idx_num - CORR_WINDOW + 1
-                                win_end = peak_idx_num + 1
-                                
-                                window_devs = all_deviations.iloc[win_start:win_end]
+                            # РАСЧЕТ RCA ПО ОТКЛОНЕНИЯМ (Свое окно)
+                            if peak_idx_num_dev >= CORR_WINDOW:
+                                win_start_dev = peak_idx_num_dev - CORR_WINDOW + 1
+                                win_end_dev = peak_idx_num_dev + 1
+                                window_devs = all_deviations.iloc[win_start_dev:win_end_dev]
                                 valid_devs = window_devs.dropna(subset=[param])
-                                
-                                window_actuals = test_df[predicted_params].iloc[win_start:win_end]
-                                valid_actuals = window_actuals.dropna(subset=[param])
                                 
                                 if len(valid_devs) >= CORR_WINDOW * 0.8:
                                     corrs_dev = valid_devs.corrwith(valid_devs[param]).drop(param)
@@ -408,21 +427,31 @@ def main():
                                             r_val = corrs_dev[cp]
                                             rca_dev_items_text.append(f"{cp} (r={r_val:.2f})")
                                         for cp in top_corrs_radar.index:
-                                            radar_data[cp] = corrs_dev[cp]
+                                            radar_data_dev[cp] = corrs_dev[cp]
                                         rca_dev_string = ", ".join(rca_dev_items_text)
                                     else:
                                         rca_dev_string = "Нет сильных связей"
                                         
+                            # РАСЧЕТ RCA ПО ФАКТАМ (Свое независимое окно)
+                            if peak_idx_num_act >= CORR_WINDOW:
+                                win_start_act = peak_idx_num_act - CORR_WINDOW + 1
+                                win_end_act = peak_idx_num_act + 1
+                                window_actuals = test_df[predicted_params].iloc[win_start_act:win_end_act]
+                                valid_actuals = window_actuals.dropna(subset=[param])
+                                
                                 if len(valid_actuals) >= CORR_WINDOW * 0.8:
                                     corrs_act = valid_actuals.corrwith(valid_actuals[param]).drop(param)
                                     corrs_act = corrs_act[corrs_act.abs() >= CORR_THRESHOLD_FACT].dropna()
                                     
-                                    top_corrs_act_text = corrs_act.abs().sort_values(ascending=False).head(3)
+                                    top_corrs_radar_act = corrs_act.abs().sort_values(ascending=False).head(5)
+                                    top_corrs_act_text = top_corrs_radar_act.head(3)
                                     
-                                    if not top_corrs_act_text.empty:
+                                    if not top_corrs_radar_act.empty:
                                         for cp in top_corrs_act_text.index:
                                             r_val = corrs_act[cp]
                                             rca_act_items_text.append(f"{cp} (r={r_val:.2f})")
+                                        for cp in top_corrs_radar_act.index:
+                                            radar_data_act[cp] = corrs_act[cp]
                                         rca_act_string = ", ".join(rca_act_items_text)
                                     else:
                                         rca_act_string = "Нет сильных связей"
@@ -433,60 +462,72 @@ def main():
                             incident_log.append({
                                 'Время начала': start_time.strftime('%Y-%m-%d %H:%M:%S'),
                                 'Параметр': param,
-                                'Макс. отклонение': f"{peak_val:.2f}",
+                                'Макс. отклонение': f"{peak_val_dev:.2f}",
                                 'Уставка (3σ)': f"{threshold_val:.2f}",
                                 'Длительность (точек)': duration,
                                 'Связанные отклонения (RCA)': rca_dev_string,
                                 'Связанные факты': rca_act_string
                             })
                             
-                            if radar_data:
-                                safe_param = str(param).translate(str.maketrans('<>:"/\\|?*', '_________'))
-                                safe_time = start_time.strftime("%Y%m%d_%H%M%S")
-                                generate_radar_chart(param, radar_data, safe_param, safe_time, start_time.strftime('%Y-%m-%d %H:%M:%S'))
+                            safe_param = str(param).translate(str.maketrans('<>:"/\\|?*', '_________'))
+                            safe_time = start_time.strftime("%Y%m%d_%H%M%S")
+                            
+                            if radar_data_dev:
+                                generate_radar_chart(param, radar_data_dev, safe_param, safe_time, start_time.strftime('%Y-%m-%d %H:%M:%S'), "RCA Отклонения")
+                            if radar_data_act:
+                                generate_radar_chart(param, radar_data_act, safe_param, safe_time, start_time.strftime('%Y-%m-%d %H:%M:%S'), "RCA Факты")
                                 
-                            abs_peak = abs(peak_val)
+                            abs_peak = abs(peak_val_dev)
                             if rca_dev_items_text or rca_act_items_text:
                                 if abs_peak > max_dev_with_rca:
                                     max_dev_with_rca = abs_peak
                                     
                                     text_parts = []
                                     if rca_dev_items_text:
-                                        text_parts.append("По Отклонениям:")
+                                        text_parts.append("По Отклонениям (Красная точка):")
                                         text_parts.extend([f"  {i+1}. {x}" for i, x in enumerate(rca_dev_items_text)])
                                     else:
-                                        text_parts.append("По Отклонениям: Нет")
+                                        text_parts.append("По Отклонениям (Красная точка): Нет")
                                         
                                     text_parts.append("")
                                         
                                     if rca_act_items_text:
-                                        text_parts.append("По Фактам:")
+                                        text_parts.append("По Фактам (Синяя точка):")
                                         text_parts.extend([f"  {i+1}. {x}" for i, x in enumerate(rca_act_items_text)])
                                     else:
-                                        text_parts.append("По Фактам: Нет")
+                                        text_parts.append("По Фактам (Синяя точка): Нет")
                                         
                                     best_rca_text = "\n".join(text_parts)
-                                    best_rca_time = peak_time
-                                    best_rca_val = peak_val
+                                    best_rca_time_dev = peak_time_dev
+                                    best_rca_val_dev = peak_val_dev
+                                    best_rca_time_act = peak_time_act
+                                    best_rca_val_act = peak_val_act
                             else:
                                 if abs_peak > max_dev_no_rca:
                                     max_dev_no_rca = abs_peak
                                     fallback_rca_text = f"По Отклонениям: {rca_dev_string}\n\nПо Фактам: {rca_act_string}"
-                                    fallback_rca_time = peak_time
-                                    fallback_rca_val = peak_val
+                                    fallback_rca_time_dev = peak_time_dev
+                                    fallback_rca_val_dev = peak_val_dev
 
-            if best_rca_time is not None:
+            # Выбор итогового блока для врезки
+            if best_rca_time_dev is not None or best_rca_time_act is not None:
                 final_rca_text = best_rca_text
-                final_peak_time = best_rca_time
-                final_peak_val = best_rca_val
-            elif fallback_rca_time is not None:
+                final_peak_time_dev = best_rca_time_dev
+                final_peak_val_dev = best_rca_val_dev
+                final_peak_time_act = best_rca_time_act
+                final_peak_val_act = best_rca_val_act
+            elif fallback_rca_time_dev is not None:
                 final_rca_text = fallback_rca_text
-                final_peak_time = fallback_rca_time
-                final_peak_val = fallback_rca_val
+                final_peak_time_dev = fallback_rca_time_dev
+                final_peak_val_dev = fallback_rca_val_dev
+                final_peak_time_act = None
+                final_peak_val_act = None
             else:
                 final_rca_text = ""
-                final_peak_time = None
-                final_peak_val = None
+                final_peak_time_dev = None
+                final_peak_val_dev = None
+                final_peak_time_act = None
+                final_peak_val_act = None
 
             valid_data = result_df.dropna(subset=['Predicted'])
             
@@ -505,7 +546,8 @@ def main():
             summary.append([param, f"{mape:.2f}", f"{max_dev:.4f}", f"{mbe:.4f}", f"{rmse:.4f}", f"{r2:.4f}"])
             results[param] = result_df
             
-            visualize_results(result_df, param, final_rca_text, final_peak_time, final_peak_val)
+            # Отрисовка с ДВУМЯ независимыми точками пиков
+            visualize_results(result_df, param, final_rca_text, final_peak_time_dev, final_peak_val_dev, final_peak_time_act, final_peak_val_act)
             
             for mode in MODES.keys():
                 mask_mode = (mode_tracking == mode) & result_df['Deviation'].notna()
@@ -514,9 +556,50 @@ def main():
                     mode_summary.append([mode, param, f"{mae_mode:.4f}"])
 
         # ==========================================
-        # НОВЫЙ БЛОК: ТЕПЛОВЫЕ КАРТЫ
+        # ВЕРНУЛИ: ИНДЕКС ЗДОРОВЬЯ И HEATMAP АНОМАЛИЙ (Z-SCORE)
         # ==========================================
-        logging.info("Построение тепловых карт корреляции (Матрицы)...")
+        logging.info("Расчет Индекса Здоровья (Health Score) и Тепловой Карты Z-Score...")
+        Z_score = (np.abs(test_df[predicted_params] - all_predictions[predicted_params]) / all_sigmas[predicted_params]).astype(float)
+        
+        # 1. Deviation Heatmap (Z-score)
+        fig, ax = plt.subplots(figsize=(16, max(8, len(predicted_params)*0.3)))
+        Z_plot = Z_score.dropna(how='all')
+        if len(Z_plot) > 800:
+            Z_plot = Z_plot.iloc[::len(Z_plot)//800]
+        Z_plot.index = Z_plot.index.strftime('%Y-%m-%d %H:%M')
+        
+        sns.heatmap(Z_plot.T, cmap='RdYlGn_r', vmin=0, vmax=SIGMA_MULTIPLIER * 1.5, ax=ax, 
+                    cbar_kws={'label': 'Нормированное отклонение (Z-score)'})
+        ax.set_title(f"Тепловая карта аномалий (Красный цвет = превышение уставки {SIGMA_MULTIPLIER}σ)", fontsize=14)
+        plt.savefig(os.path.join(PLOT_FOLDER, '00_Deviation_Heatmap.png'), dpi=DPI, bbox_inches='tight')
+        plt.close()
+
+        # 2. Overall Health Score
+        exceedances = np.maximum(0, Z_score - SIGMA_MULTIPLIER)
+        active_params_count = Z_score.notna().sum(axis=1)
+        active_params_count[active_params_count == 0] = 1 
+        
+        mean_exceedance = exceedances.sum(axis=1) / active_params_count
+        health_score = np.maximum(0, 100 - mean_exceedance * 50) 
+        
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.plot(health_score.index, health_score, color='green', linewidth=2)
+        ax.fill_between(health_score.index, health_score, 0, color='green', alpha=0.1)
+        ax.set_title("Индекс технического состояния оборудования (Overall Health Score)", fontsize=14)
+        ax.set_ylabel("Health Score, %")
+        ax.set_ylim(0, 105)
+        ax.axhline(80, color='orange', linestyle='--', label='Предупреждение (80%)')
+        ax.axhline(50, color='red', linestyle='--', label='Критическое состояние (50%)')
+        ax.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d\n%H:%M:%S'))
+        ax.grid(alpha=0.3)
+        ax.legend()
+        plt.savefig(os.path.join(PLOT_FOLDER, '00_Health_Score.png'), dpi=DPI, bbox_inches='tight')
+        plt.close()
+
+        # ==========================================
+        # ТЕПЛОВЫЕ КАРТЫ КОРРЕЛЯЦИЙ (GLOBAL)
+        # ==========================================
+        logging.info("Построение глобальных тепловых карт корреляции (Матрицы)...")
         plt.figure(figsize=(14, 12))
         sns.heatmap(all_deviations.corr(), cmap='coolwarm', vmin=-1, vmax=1)
         plt.title('Тепловая карта корреляции ОТКЛОНЕНИЙ', fontsize=14)
@@ -530,16 +613,14 @@ def main():
         plt.close()
 
         # ==========================================
-        # НОВЫЙ БЛОК: СКОЛЬЗЯЩАЯ КОРРЕЛЯЦИЯ (Rolling Corr)
+        # СКОЛЬЗЯЩАЯ КОРРЕЛЯЦИЯ (Rolling Corr)
         # ==========================================
         logging.info(f"Построение графиков скользящей корреляции для ТОП-{TOP_N_ROLLING} аномалий...")
-        # Находим ТОП параметров с наибольшим максимальным отклонением за весь период
         top_params = all_deviations.abs().max().nlargest(TOP_N_ROLLING).index
         for param in top_params:
             corrs = all_deviations.corrwith(all_deviations[param]).drop(param)
             if not corrs.empty and not corrs.isna().all():
                 best_pair = corrs.abs().idxmax()
-                # Считаем скользящую корреляцию
                 rolling_c = all_deviations[param].rolling(window=CORR_WINDOW).corr(all_deviations[best_pair])
                 
                 fig, ax = plt.subplots(figsize=(14, 4))
@@ -557,7 +638,7 @@ def main():
                 plt.close()
 
         # ==========================================
-        # НОВЫЙ БЛОК: КРОСС-КОРРЕЛЯЦИЯ (Поиск задержек)
+        # КРОСС-КОРРЕЛЯЦИЯ (Поиск задержек)
         # ==========================================
         logging.info("Анализ временных задержек (Кросс-коррелограммы)...")
         cols = predicted_params
@@ -576,7 +657,6 @@ def main():
                 best_val = cross_corrs[max_corr_idx]
                 best_lag = lags[max_corr_idx]
                 
-                # Если найдена сильная связь со сдвигом - рисуем график
                 if abs(best_val) >= CROSS_CORR_THRESHOLD:
                     fig, ax = plt.subplots(figsize=(8, 5))
                     ax.bar(lags, cross_corrs, color='steelblue')
